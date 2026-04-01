@@ -404,7 +404,7 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
                 results["patched"] += 1
             else:
                 results["failed"] += 1
-                results["errors"].append(f"PATCH {batch_nb}: {resp.status_code}")
+                results["errors"].append(f"PATCH {batch_nb}: {resp.status_code} {resp.text[:300]}")
             time.sleep(0.1)
 
     for batch_nb in missing_batches:
@@ -662,7 +662,10 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
         else:
             results["raw_failed"] += 1
             if results["raw_failed"] <= 3:
-                results["errors"].append(f"RAW TX row {row_count}: {resp.status_code} {resp.text[:150]}")
+                # Log full error + payload keys for debugging
+                err_text = resp.text[:500] if resp.text else "no response"
+                payload_keys = list(clean.keys())
+                results["errors"].append(f"RAW TX row {row_count}: {resp.status_code} keys={payload_keys} err={err_text}")
         time.sleep(0.05)
 
     wb.close()
