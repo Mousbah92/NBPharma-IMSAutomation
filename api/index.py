@@ -296,11 +296,11 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
         time.sleep(0.1)
     return results
 
-# ── PIPELINE B: UPLOAD PRODUCT METRICS ──
+# ── PIPELINE B: UPLOAD PRODUCT METRICS (with dedup) ──
 
 def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
                             dist_guid, brand_guids, dist_set, prod_set):
-    results = {"metrics_created": 0, "metrics_failed": 0, "errors": []}
+    results = {"metrics_created": 0, "metrics_updated": 0, "metrics_failed": 0, "errors": []}
     metric_map = discover_metric_picklist()
     if not metric_map:
         results["errors"].append("Could not discover metric picklist")
@@ -341,6 +341,8 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
             "ma_metric": METRICS[metric_key], "ma_month": month, "ma_year": year,
             "ma_value": int(round(value)),
             pd_primary: f"{metric_key}_{brand}_UNI_{year}-{month:02d}",
+            "_product_guid": brand_guids[brand],
+            "_metric_int": METRICS[metric_key],
         })
 
     if file_type == "closing_stock" and stock_product_agg:
@@ -362,22 +364,224 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
             add_metric(brand, "total_non_sales", v["foc_qty"], 9, 2025)
 
     log.info(f"Prepared {len(records)} metric records for ma_imsproductdata")
+
+    # DEDUP: check if record exists before creating
     for rec in records:
+        product_guid = rec.pop("_product_guid")
+        metric_int = rec.pop("_metric_int")
+        month = rec["ma_month"]
+        year = rec["ma_year"]
+
+        # Search for existing record with same product + metric + month + year
+        filter_str = (f"_ma_product_value eq {product_guid}"
+                      f" and ma_metric eq {metric_int}"
+                      f" and ma_month eq {month}"
+                      f" and ma_year eq {year}"
+                      f" and _ma_distributor_value eq {dist_guid}")
+        check_url = f"{API_URL}/{pd_set}?$filter={filter_str}&$top=1"
+        check_resp = http_requests.get(check_url, headers=get_headers(), timeout=15)
+
+        existing = None
+        if check_resp.status_code == 200:
+            existing_records = check_resp.json().get("value", [])
+            if existing_records:
+                existing = existing_records[0]
+
         clean = safe_payload(rec, pd_columns)
-        resp = http_requests.post(f"{API_URL}/{pd_set}", headers=get_headers(), json=clean, timeout=30)
-        if resp.status_code in (200, 201, 204):
-            results["metrics_created"] += 1
+
+        if existing:
+            # PATCH existing record (update value)
+            rec_id = existing.get("ma_imsproductdataid") or existing.get("ma_imsproductdatasid")
+            if not rec_id:
+                for k, v in existing.items():
+                    if k.endswith("id") and k.startswith("ma_") and v:
+                        rec_id = v
+                        break
+            if rec_id:
+                patch_payload = {"ma_value": clean.get("ma_value", 0)}
+                resp = http_requests.patch(f"{API_URL}/{pd_set}({rec_id})",
+                    headers=get_headers(), json=patch_payload, timeout=30)
+                if resp.status_code in (200, 204):
+                    results["metrics_updated"] += 1
+                else:
+                    results["metrics_failed"] += 1
+                    results["errors"].append(f"METRIC PATCH: {resp.status_code}")
+            else:
+                results["metrics_failed"] += 1
+                results["errors"].append("Could not find record ID for existing metric")
         else:
-            results["metrics_failed"] += 1
-            results["errors"].append(f"METRIC {rec.get(pd_primary, '?')}: {resp.status_code}")
+            # CREATE new record
+            resp = http_requests.post(f"{API_URL}/{pd_set}", headers=get_headers(), json=clean, timeout=30)
+            if resp.status_code in (200, 201, 204):
+                results["metrics_created"] += 1
+            else:
+                results["metrics_failed"] += 1
+                results["errors"].append(f"METRIC CREATE: {resp.status_code}")
         time.sleep(0.1)
+    return results
+
+# ── PIPELINE C: UPLOAD RAW TRANSACTIONS (ma_IMSRawTransactions) ──
+
+def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_guids, dist_set, prod_set):
+    """Upload individual transaction rows from MTD Sales to ma_IMSRawTransactions."""
+    results = {"raw_created": 0, "raw_failed": 0, "errors": []}
+
+    if file_type != "mtd_sales":
+        return results
+
+    try:
+        raw_set = resolve_odata_set("ma_imsrawtransactions")
+    except Exception:
+        results["errors"].append("ma_imsrawtransactions table not accessible, skipping")
+        return results
+
+    raw_columns, raw_primary = discover_valid_columns("ma_imsrawtransactions")
+    if not raw_columns:
+        results["errors"].append("Could not discover raw transactions columns")
+        return results
+
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+    ws = wb.active
+    row_count = 0
+
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        brand = str(row[21] or "").strip()
+        if not brand:
+            continue
+        row_count += 1
+
+        bill_date = row[13]
+        date_str = bill_date.strftime("%Y-%m-%d") if isinstance(bill_date, datetime) else None
+
+        payload = {"ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})"}
+        if brand in brand_guids:
+            payload["ma_Product@odata.bind"] = f"/{prod_set}({brand_guids[brand]})"
+
+        # Map MTD columns → actual Dataverse schema column names
+        # (from Deploy-DataverseSchema.ps1 Phase 2)
+        field_map = {
+            "ma_distributoritemcode": str(row[7] or ""),     # Material code (U190001)
+            "ma_itemdescription": str(row[8] or ""),         # Material Name
+            "ma_customername": str(row[1] or ""),            # Ship To Name
+            "ma_customergroup": str(row[2] or ""),           # Customer Group 1
+            "ma_region": str(row[4] or ""),                  # Region
+            "ma_batchnumber": str(row[18] or ""),            # Batch
+            "ma_billingdocument": str(row[16] or ""),        # Bill.Docs.
+            "ma_ponumber": str(row[20] or ""),               # Purchase order number
+            "ma_period": "2025-09",                          # Period
+        }
+        for k, v in field_map.items():
+            if k in raw_columns and v:
+                payload[k] = v[:200] if len(v) > 200 else v
+
+        # Numeric fields (ma_quantity and ma_value are Decimal in schema)
+        try:
+            qty = float(row[10]) if row[10] is not None else 0
+            val = float(row[11]) if row[11] is not None else 0
+        except (ValueError, TypeError):
+            qty, val = 0, 0
+
+        if "ma_quantity" in raw_columns:
+            payload["ma_quantity"] = qty
+        if "ma_value" in raw_columns:
+            payload["ma_value"] = val
+
+        # Integer fields
+        if "ma_month" in raw_columns:
+            payload["ma_month"] = 9
+        if "ma_year" in raw_columns:
+            payload["ma_year"] = 2025
+
+        # Date fields
+        if date_str and "ma_transactiondate" in raw_columns:
+            payload["ma_transactiondate"] = date_str
+        exp = row[19]
+        if exp and isinstance(exp, datetime) and "ma_expirydate" in raw_columns:
+            payload["ma_expirydate"] = exp.strftime("%Y-%m-%d")
+
+        # Boolean: FOC flag
+        billt = str(row[12] or "").strip()
+        if "ma_isfoc" in raw_columns:
+            payload["ma_isfoc"] = billt in ("ZRE5", "ZUFA")
+
+        # Primary name: transactionid
+        if raw_primary:
+            payload[raw_primary] = f"UNI-{row[14] or row_count}-{str(row[0] or '')}-2025-09"
+
+        clean = safe_payload(payload, raw_columns)
+        resp = http_requests.post(f"{API_URL}/{raw_set}", headers=get_headers(), json=clean, timeout=30)
+        if resp.status_code in (200, 201, 204):
+            results["raw_created"] += 1
+        else:
+            results["raw_failed"] += 1
+            if results["raw_failed"] <= 3:
+                results["errors"].append(f"RAW TX row {row_count}: {resp.status_code} {resp.text[:150]}")
+        time.sleep(0.05)
+
+    wb.close()
+    log.info(f"Raw transactions: {results['raw_created']} created, {results['raw_failed']} failed out of {row_count}")
+    return results
+
+# ── PIPELINE D: TRACK IMPORT BATCH (ma_IMSImportBatches) ──
+
+def pipeline_track_import(file_type, filename, dist_guid, dist_set, total_rows, parsed_rows, failed_rows, processing_time):
+    """Create an import batch record for audit trail."""
+    results = {"import_tracked": False, "errors": []}
+
+    try:
+        import_set = resolve_odata_set("ma_imsimportbatches")
+    except Exception:
+        return results
+
+    import_columns, import_primary = discover_valid_columns("ma_imsimportbatches")
+    if not import_columns:
+        return results
+
+    payload = {"ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})"}
+
+    field_map = {
+        "ma_filename": filename[:200] if filename else "unknown",
+        "ma_source": "Power Automate / Vercel",
+    }
+    for k, v in field_map.items():
+        if k in import_columns:
+            payload[k] = v
+
+    int_map = {
+        "ma_totalrows": total_rows,
+        "ma_parsedrows": parsed_rows,
+        "ma_errorrows": failed_rows,
+    }
+    for k, v in int_map.items():
+        if k in import_columns:
+            payload[k] = v
+
+    if "ma_importdate" in import_columns:
+        payload["ma_importdate"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if "ma_processingtime" in import_columns:
+        payload["ma_processingtime"] = int(processing_time)
+
+    if import_primary:
+        payload[import_primary] = f"{file_type}_{filename[:50]}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+
+    clean = safe_payload(payload, import_columns)
+    resp = http_requests.post(f"{API_URL}/{import_set}", headers=get_headers(), json=clean, timeout=30)
+    if resp.status_code in (200, 201, 204):
+        results["import_tracked"] = True
+    else:
+        results["errors"].append(f"IMPORT BATCH: {resp.status_code}")
+
     return results
 
 # ── MAIN PROCESSING ──
 
 def process_file(file_type, file_bytes):
     results = {"status": "processing", "file_type": file_type, "steps": [],
-        "batches_patched": 0, "batches_created": 0, "metrics_created": 0, "failed": 0, "errors": []}
+        "batches_patched": 0, "batches_created": 0,
+        "metrics_created": 0, "metrics_updated": 0, "raw_created": 0,
+        "failed": 0, "errors": []}
+    _start_time = time.time()
     try:
         stock_batches, stock_product_agg, mtd_batches, mtd_product_metrics = {}, {}, {}, {}
         if file_type == "closing_stock":
@@ -426,13 +630,33 @@ def process_file(file_type, file_bytes):
         results["errors"].extend(br["errors"])
         results["steps"].append(f"Batches: {br['patched']} patched, {br['created']} created")
 
-        # PIPELINE B: Upload product metrics
+        # PIPELINE B: Upload product metrics (with dedup)
         mr = pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
             dist_guid, brand_guids, dist_set, prod_set)
         results["metrics_created"] = mr["metrics_created"]
+        results["metrics_updated"] = mr.get("metrics_updated", 0)
         results["failed"] += mr["metrics_failed"]
         results["errors"].extend(mr["errors"])
-        results["steps"].append(f"Metrics: {mr['metrics_created']} created in ma_imsproductdata")
+        results["steps"].append(
+            f"Metrics: {mr['metrics_created']} new, {mr.get('metrics_updated', 0)} updated")
+
+        # PIPELINE C: Upload raw transactions (MTD only)
+        rr = pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_guids, dist_set, prod_set)
+        results["raw_created"] = rr["raw_created"]
+        results["failed"] += rr["raw_failed"]
+        results["errors"].extend(rr["errors"])
+        if rr["raw_created"] > 0:
+            results["steps"].append(f"Raw Transactions: {rr['raw_created']} rows")
+
+        # PIPELINE D: Track import batch
+        processing_time = time.time() - _start_time
+        total_rows = len(stock_batches) + len(mtd_batches) + rr.get("raw_created", 0)
+        ir = pipeline_track_import(file_type, results.get("filename", "unknown"),
+            dist_guid, dist_set, total_rows,
+            br["patched"] + br["created"] + mr["metrics_created"] + mr.get("metrics_updated", 0) + rr["raw_created"],
+            results["failed"], processing_time)
+        if ir["import_tracked"]:
+            results["steps"].append("Import batch recorded in ma_IMSImportBatches")
 
         results["status"] = "success"
     except Exception as e:
@@ -503,6 +727,8 @@ def process():
     tp = sum(r.get("batches_patched", 0) for r in all_results)
     tc = sum(r.get("batches_created", 0) for r in all_results)
     tm = sum(r.get("metrics_created", 0) for r in all_results)
+    tu = sum(r.get("metrics_updated", 0) for r in all_results)
+    tr = sum(r.get("raw_created", 0) for r in all_results)
     tf = sum(r.get("failed", 0) for r in all_results)
     errs = []
     for r in all_results:
@@ -513,7 +739,9 @@ def process():
         st = "error"
 
     response = {"status": st, "summary": {"files_processed": len(files_to_process),
-        "batches_patched": tp, "batches_created": tc, "metrics_created": tm, "failed": tf},
+        "batches_patched": tp, "batches_created": tc,
+        "metrics_created": tm, "metrics_updated": tu,
+        "raw_transactions": tr, "failed": tf},
         "files": all_results, "errors": errs[:10]}
     return jsonify(response), 200 if st in ("success", "partial") else 500
 
