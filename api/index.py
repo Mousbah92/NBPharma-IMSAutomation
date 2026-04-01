@@ -93,7 +93,7 @@ def discover_valid_columns(table_name):
             if ln.startswith("ma_"):
                 columns.add(ln)
                 if a["AttributeType"] == "String" and not primary_name:
-                    if "batchid" in ln or "dataid" in ln or "name" in ln:
+                    if "batchid" in ln or "dataid" in ln or "name" in ln or "transactionid" in ln:
                         primary_name = ln
     return columns, primary_name
 
@@ -376,7 +376,7 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
         if batch_nb in stock_batches:
             sd = stock_batches[batch_nb]
             payload.update({"ma_month": sd.get("month", 9), "ma_year": sd.get("year", 2025),
-                "ma_quantity": sd["closing"], "ma_openingqty": sd["opening"], "ma_closingqty": sd["closing"]})
+                "ma_quantity": max(0, sd["closing"]), "ma_openingqty": max(0, sd["opening"]), "ma_closingqty": max(0, sd["closing"])})
             nbp_info = sd.get("nbp_info", {})
             if nbp_info:
                 payload["ma_itemno"] = nbp_info["nbp_desc"]
@@ -387,7 +387,7 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
                 payload["ma_Product@odata.bind"] = f"/{prod_set}({brand_guids[brand]})"
         elif batch_nb in mtd_batches:
             md = mtd_batches[batch_nb]
-            payload.update({"ma_month": 9, "ma_year": 2025, "ma_quantity": int(md["qty"]), "ma_itemno": md["name"]})
+            payload.update({"ma_month": 9, "ma_year": 2025, "ma_quantity": max(0, int(md["qty"])), "ma_itemno": md["name"]})
             if md.get("expiry"):
                 payload["ma_expirydate"] = md["expiry"]
             brand = md.get("brand", "")
@@ -597,9 +597,9 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
         if not month:
             month, year = 9, 2025
 
-        payload = {"ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})"}
+        payload = {"ma_distributor@odata.bind": f"/{dist_set}({dist_guid})"}
         if brand in brand_guids:
-            payload["ma_Product@odata.bind"] = f"/{prod_set}({brand_guids[brand]})"
+            payload["ma_product@odata.bind"] = f"/{prod_set}({brand_guids[brand]})"
 
         field_map = {
             "ma_distributoritemcode": get_col_str(row, col, "material_code"),
@@ -687,7 +687,7 @@ def pipeline_track_import(file_type, filename, dist_guid, dist_set, total_rows, 
     if not import_columns:
         return results
 
-    payload = {"ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})"}
+    payload = {"ma_distributor@odata.bind": f"/{dist_set}({dist_guid})"}
 
     field_map = {
         "ma_filename": filename[:200] if filename else "unknown",
