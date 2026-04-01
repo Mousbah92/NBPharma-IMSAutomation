@@ -129,37 +129,145 @@ def find_product_guid(brand_name, all_products):
                 return p["ma_imsproductsid"]
     return None
 
-# ── PARSERS ──
+# ── DYNAMIC COLUMN MAPPER ──
+# Auto-detects column positions from headers — works with ANY distributor template
+
+COLUMN_RULES = {
+    # field_key: list of header keywords to match (case-insensitive)
+    "material_code": ["material", "item number", "item no", "item code", "sku", "product code", "matl"],
+    "product_name": ["material name", "product description", "item description", "description", "product name"],
+    "customer_name": ["ship to name", "customer name", "customer", "sold to name"],
+    "customer_code": ["ship to", "customer id", "customer code", "sold to"],
+    "customer_group": ["customer group", "cust group", "channel"],
+    "region": ["region", "city", "area", "territory"],
+    "salesman": ["salesman", "sales rep", "rep"],
+    "batch": ["batch", "lot", "lot number", "batch number"],
+    "expiry": ["expiry", "exp date", "expiry date", "batch expiry", "best before"],
+    "qty": ["nett sales quantity", "normal qty", "quantity", "sales qty", "base unit quantity", "qty"],
+    "value": ["nett sales value", "net value", "value", "amount", "sales value"],
+    "foc_qty": ["foc qty", "foc quantity", "free goods"],
+    "sample_qty": ["sample qty", "sample quantity"],
+    "bill_type": ["billt", "bill. doc. type", "billing type", "doc type"],
+    "bill_date": ["bill date", "billing effective date", "invoice date", "billing date"],
+    "sales_doc": ["sales doc", "sales order", "invoice number", "document number"],
+    "bill_doc": ["bill.docs", "billing document", "invoice number"],
+    "po_number": ["purchase order", "po number", "cust. reference", "reference"],
+    "brand": ["brand", "principal", "manufacturer", "supplier"],
+    "opening": ["opening stock", "opening bal", "opening"],
+    "closing": ["closing stock", "closing bal", "closing"],
+    "from_date": ["from date", "start date", "period start"],
+    "to_date": ["to date", "end date", "period end"],
+    "pack_size": ["pack size", "pack", "bun", "uom"],
+    "unit_price": ["unit price", "price"],
+}
+
+
+def auto_map_columns(headers):
+    """Auto-detect column positions from headers. Returns {field_key: col_index}.
+    Uses two-pass matching: exact match first, then substring match."""
+    mapping = {}
+    headers_lower = [(h or "").strip().lower() for h in headers]
+
+    # Pass 1: exact matches only
+    for field_key, keywords in COLUMN_RULES.items():
+        for kw in keywords:
+            for idx, h in enumerate(headers_lower):
+                if h == kw:
+                    if field_key not in mapping:
+                        mapping[field_key] = idx
+                        break
+            if field_key in mapping:
+                break
+
+    # Pass 2: substring matches for remaining unmapped fields
+    for field_key, keywords in COLUMN_RULES.items():
+        if field_key in mapping:
+            continue
+        for kw in keywords:
+            if len(kw) < 4:
+                continue  # Skip short keywords for substring matching
+            for idx, h in enumerate(headers_lower):
+                if kw in h and idx not in mapping.values():
+                    mapping[field_key] = idx
+                    break
+            if field_key in mapping:
+                break
+
+    return mapping
+
+
+def get_col(row, mapping, field_key, default=None):
+    """Safely get a column value by mapped field key."""
+    idx = mapping.get(field_key)
+    if idx is not None and idx < len(row):
+        val = row[idx]
+        return val if val is not None else default
+    return default
+
+
+def get_col_str(row, mapping, field_key, default=""):
+    val = get_col(row, mapping, field_key, default)
+    return str(val).strip() if val is not None else default
+
+
+def get_col_float(row, mapping, field_key, default=0):
+    val = get_col(row, mapping, field_key, default)
+    try:
+        return float(val) if val is not None else default
+    except (ValueError, TypeError):
+        return default
+
+
+def detect_month_year(row, mapping):
+    """Extract month/year from date fields."""
+    for date_field in ["bill_date", "from_date"]:
+        val = get_col(row, mapping, date_field)
+        if val:
+            if isinstance(val, datetime):
+                return val.month, val.year
+            s = str(val).strip()
+            # Try dd.mm.yyyy
+            if "." in s:
+                parts = s.split(".")
+                try:
+                    return int(parts[1]), int(parts[2])
+                except (IndexError, ValueError):
+                    pass
+    return None, None
+
+
+# ── PARSERS (DYNAMIC) ──
 
 def parse_closing_stock(file_bytes):
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
     ws = wb.active
+    headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    col = auto_map_columns(headers)
+    log.info(f"Closing Stock auto-mapped: {col}")
+
     batches = {}
     product_agg = defaultdict(lambda: {"opening": 0, "closing": 0, "description": "", "month": 9, "year": 2025})
     for row in ws.iter_rows(min_row=2, values_only=True):
-        material = str(row[0]).strip() if row[0] else None
+        material = get_col_str(row, col, "material_code")
         if not material:
             continue
-        batch_nb = str(row[4]).strip() if row[4] else ""
-        from_date = row[9]
-        if isinstance(from_date, str):
-            parts = from_date.split(".")
-            month, year = int(parts[1]), int(parts[2])
-        elif isinstance(from_date, datetime):
-            month, year = from_date.month, from_date.year
-        else:
+        batch_nb = get_col_str(row, col, "batch")
+        month, year = detect_month_year(row, col)
+        if not month:
             month, year = 9, 2025
-        expiry = row[6]
+
+        expiry = get_col(row, col, "expiry")
         expiry_str = expiry.strftime("%Y-%m-%d") if isinstance(expiry, datetime) else (str(expiry)[:10] if expiry else None)
-        opening = int(row[7]) if row[7] is not None else 0
-        closing = int(row[8]) if row[8] is not None else 0
+        opening = int(get_col_float(row, col, "opening", 0))
+        closing = int(get_col_float(row, col, "closing", 0))
+
         if batch_nb:
-            batches[batch_nb] = {"material": material, "description": str(row[1] or ""),
+            batches[batch_nb] = {"material": material, "description": get_col_str(row, col, "product_name"),
                 "opening": opening, "closing": closing, "expiry": expiry_str,
                 "month": month, "year": year, "nbp_info": UNICARE_PRODUCT_MAP.get(material, {})}
         product_agg[material]["opening"] += opening
         product_agg[material]["closing"] += closing
-        product_agg[material]["description"] = str(row[1] or "")
+        product_agg[material]["description"] = get_col_str(row, col, "product_name")
         product_agg[material]["month"] = month
         product_agg[material]["year"] = year
     wb.close()
@@ -168,34 +276,58 @@ def parse_closing_stock(file_bytes):
 def parse_mtd_sales(file_bytes):
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
     ws = wb.active
+    headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    col = auto_map_columns(headers)
+    log.info(f"MTD Sales auto-mapped: {col}")
+
     batches = defaultdict(lambda: {"qty": 0, "value": 0, "material": "", "name": "", "brand": "", "expiry": None})
     product_metrics = defaultdict(lambda: {"private_qty": 0, "private_val": 0, "tender_qty": 0, "tender_val": 0,
                                            "foc_qty": 0, "foc_val": 0, "total_qty": 0, "total_val": 0})
     for row in ws.iter_rows(min_row=2, values_only=True):
-        brand = str(row[21] or "").strip()
-        batch = str(row[18] or "").strip()
-        custgroup = str(row[2] or "").strip().lower()
-        billt = str(row[12] or "").strip()
-        try:
-            qty = float(row[10]) if row[10] is not None else 0
-            val = float(row[11]) if row[11] is not None else 0
-        except (ValueError, TypeError):
-            continue
+        # Get product identifier — try brand first, then material name, then material code
+        brand = get_col_str(row, col, "brand")
+        product_name = get_col_str(row, col, "product_name")
+        material_code = get_col_str(row, col, "material_code")
+
+        # Derive brand from product name if no brand column
+        if not brand and product_name:
+            brand = product_name.split()[0].upper() if product_name.split() else ""
+        if not brand and material_code:
+            # Try UNICARE_PRODUCT_MAP
+            info = UNICARE_PRODUCT_MAP.get(material_code, {})
+            brand = info.get("brand", material_code)
         if not brand:
             continue
+
+        batch = get_col_str(row, col, "batch")
+        custgroup = get_col_str(row, col, "customer_group").lower()
+        billt = get_col_str(row, col, "bill_type")
+
+        qty = get_col_float(row, col, "qty", 0)
+        val = get_col_float(row, col, "value", 0)
+        foc = get_col_float(row, col, "foc_qty", 0)
+
+        # Batch-level aggregation
         if batch:
             batches[batch]["qty"] += qty
             batches[batch]["value"] += val
-            batches[batch]["material"] = str(row[7] or "")
-            batches[batch]["name"] = str(row[8] or "")
+            batches[batch]["material"] = material_code
+            batches[batch]["name"] = product_name
             batches[batch]["brand"] = brand
-            if row[19] and isinstance(row[19], datetime):
-                batches[batch]["expiry"] = row[19].strftime("%Y-%m-%d")
-        if billt in ("ZRE5", "ZUFA"):
-            product_metrics[brand]["foc_qty"] += abs(qty)
+            exp = get_col(row, col, "expiry")
+            if exp and isinstance(exp, datetime):
+                batches[batch]["expiry"] = exp.strftime("%Y-%m-%d")
+
+        # FOC detection: explicit FOC column OR billing type
+        is_foc = foc > 0 or billt in ("ZRE5", "ZUFA")
+
+        if is_foc:
+            product_metrics[brand]["foc_qty"] += abs(foc) if foc > 0 else abs(qty)
             product_metrics[brand]["foc_val"] += abs(val)
             continue
-        if custgroup == "private":
+
+        # Regular sales by customer group
+        if custgroup in ("private", ""):
             product_metrics[brand]["private_qty"] += qty
             product_metrics[brand]["private_val"] += val
         elif custgroup == "institutional":
@@ -204,6 +336,7 @@ def parse_mtd_sales(file_bytes):
         else:
             product_metrics[brand]["private_qty"] += qty
             product_metrics[brand]["private_val"] += val
+
         product_metrics[brand]["total_qty"] += qty
         product_metrics[brand]["total_val"] += val
     wb.close()
@@ -442,71 +575,85 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
 
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
     ws = wb.active
+    headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    col = auto_map_columns(headers)
+    log.info(f"Raw TX auto-mapped: {col}")
     row_count = 0
 
     for row in ws.iter_rows(min_row=2, values_only=True):
-        brand = str(row[21] or "").strip()
-        if not brand:
+        product_name = get_col_str(row, col, "product_name")
+        if not product_name:
             continue
         row_count += 1
 
-        bill_date = row[13]
+        # Derive brand
+        brand = get_col_str(row, col, "brand")
+        if not brand and product_name:
+            brand = product_name.split()[0].upper()
+
+        bill_date = get_col(row, col, "bill_date")
         date_str = bill_date.strftime("%Y-%m-%d") if isinstance(bill_date, datetime) else None
+        month, year = detect_month_year(row, col)
+        if not month:
+            month, year = 9, 2025
 
         payload = {"ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})"}
         if brand in brand_guids:
             payload["ma_Product@odata.bind"] = f"/{prod_set}({brand_guids[brand]})"
 
-        # Map MTD columns → actual Dataverse schema column names
-        # (from Deploy-DataverseSchema.ps1 Phase 2)
         field_map = {
-            "ma_distributoritemcode": str(row[7] or ""),     # Material code (U190001)
-            "ma_itemdescription": str(row[8] or ""),         # Material Name
-            "ma_customername": str(row[1] or ""),            # Ship To Name
-            "ma_customergroup": str(row[2] or ""),           # Customer Group 1
-            "ma_region": str(row[4] or ""),                  # Region
-            "ma_batchnumber": str(row[18] or ""),            # Batch
-            "ma_billingdocument": str(row[16] or ""),        # Bill.Docs.
-            "ma_ponumber": str(row[20] or ""),               # Purchase order number
-            "ma_period": "2025-09",                          # Period
+            "ma_distributoritemcode": get_col_str(row, col, "material_code"),
+            "ma_itemdescription": product_name,
+            "ma_customername": get_col_str(row, col, "customer_name"),
+            "ma_region": get_col_str(row, col, "region"),
+            "ma_batchnumber": get_col_str(row, col, "batch"),
+            "ma_billingdocument": get_col_str(row, col, "bill_doc") or get_col_str(row, col, "sales_doc"),
+            "ma_ponumber": get_col_str(row, col, "po_number"),
+            "ma_sourcefile": "auto_import",
         }
         for k, v in field_map.items():
             if k in raw_columns and v:
                 payload[k] = v[:200] if len(v) > 200 else v
 
-        # Numeric fields (ma_quantity and ma_value are Decimal in schema)
-        try:
-            qty = float(row[10]) if row[10] is not None else 0
-            val = float(row[11]) if row[11] is not None else 0
-        except (ValueError, TypeError):
-            qty, val = 0, 0
+        # Numeric fields — ma_quantity and ma_value don't exist on this table
+        qty = get_col_float(row, col, "qty", 0)
+        val = get_col_float(row, col, "value", 0)
+        foc = get_col_float(row, col, "foc_qty", 0)
 
-        if "ma_quantity" in raw_columns:
-            payload["ma_quantity"] = qty
-        if "ma_value" in raw_columns:
-            payload["ma_value"] = val
+        if "ma_mappedsku" in raw_columns:
+            payload["ma_mappedsku"] = f"qty={qty:.0f}|val={val:.2f}"
 
         # Integer fields
         if "ma_month" in raw_columns:
-            payload["ma_month"] = 9
+            payload["ma_month"] = month
         if "ma_year" in raw_columns:
-            payload["ma_year"] = 2025
+            payload["ma_year"] = year
 
         # Date fields
         if date_str and "ma_transactiondate" in raw_columns:
             payload["ma_transactiondate"] = date_str
-        exp = row[19]
+        exp = get_col(row, col, "expiry")
         if exp and isinstance(exp, datetime) and "ma_expirydate" in raw_columns:
             payload["ma_expirydate"] = exp.strftime("%Y-%m-%d")
+        elif exp and isinstance(exp, str) and "ma_expirydate" in raw_columns:
+            # Try parsing dd.mm.yyyy
+            try:
+                parts = exp.strip().split(".")
+                if len(parts) == 3:
+                    payload["ma_expirydate"] = f"{parts[2]}-{parts[1]}-{parts[0]}"
+            except (IndexError, ValueError):
+                pass
 
         # Boolean: FOC flag
-        billt = str(row[12] or "").strip()
+        billt = get_col_str(row, col, "bill_type")
         if "ma_isfoc" in raw_columns:
-            payload["ma_isfoc"] = billt in ("ZRE5", "ZUFA")
+            payload["ma_isfoc"] = foc > 0 or billt in ("ZRE5", "ZUFA")
 
         # Primary name: transactionid
         if raw_primary:
-            payload[raw_primary] = f"UNI-{row[14] or row_count}-{str(row[0] or '')}-2025-09"
+            sales_doc = get_col_str(row, col, "sales_doc") or str(row_count)
+            cust_code = get_col_str(row, col, "customer_code") or ""
+            payload[raw_primary] = f"TX-{sales_doc}-{cust_code}-{year}-{month:02d}"
 
         clean = safe_payload(payload, raw_columns)
         resp = http_requests.post(f"{API_URL}/{raw_set}", headers=get_headers(), json=clean, timeout=30)
