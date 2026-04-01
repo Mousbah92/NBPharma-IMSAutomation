@@ -1,0 +1,16 @@
+# render.yaml — Render.com deployment config
+
+services:
+  - type: web
+    name: nbpharma-ims
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: REFRESH_TOKEN
+        sync: false
+      - key: DATAVERSE_URL
+        value: https://ppcustomprojects.crm4.dynamics.com
+      - key: API_SECRET_KEY
+        sync: false
