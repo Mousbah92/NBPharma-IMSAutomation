@@ -1,57 +1,34 @@
 """
-NBPharma IMS — Web Endpoint for Automated Batch Enrichment
-===========================================================
-Flask app that accepts distributor Excel files via HTTP POST,
+NBPharma IMS — Vercel Serverless Function
+==========================================
+Accepts distributor Excel files via HTTP POST,
 processes them, and pushes data to Dataverse.
 
-Architecture:
-  Power Automate (email trigger)
-    → Downloads Excel attachments
-    → POSTs them to this endpoint
-    → This app processes + pushes to Dataverse
-    → Returns summary JSON
-
-Deployment: Render.com free tier (or Railway, Fly.io, etc.)
-
-Auth: Uses a refresh token captured once via browser login.
-      No Azure AD App Registration required.
-      Token lasts ~90 days — re-run get_refresh_token.py to renew.
-
-Environment variables required:
-  REFRESH_TOKEN  = (from get_refresh_token.py)
-  DATAVERSE_URL  = https://ppcustomprojects.crm4.dynamics.com
-  API_SECRET_KEY = a-random-string-to-protect-endpoint
-
-Requirements:
-  pip install flask msal requests openpyxl gunicorn
+Auth: Refresh token (no App Registration needed).
 """
 
 import os
 import io
 import json
 import time
-import uuid
 import logging
-import tempfile
 from datetime import datetime
 from collections import defaultdict
+from http.server import BaseHTTPRequestHandler
 
-from flask import Flask, request, jsonify
 import msal
 import requests as http_requests
 import openpyxl
 
 # =============================================================================
-# CONFIGURATION (from environment variables)
+# CONFIGURATION
 # =============================================================================
 
 DATAVERSE_URL = os.environ.get("DATAVERSE_URL", "https://ppcustomprojects.crm4.dynamics.com")
 API_URL = f"{DATAVERSE_URL}/api/data/v9.2"
 
-# Auth via refresh token (no App Registration needed)
-# Run get_refresh_token.py locally once to capture this
 REFRESH_TOKEN = os.environ.get("REFRESH_TOKEN", "")
-CLIENT_ID = "51f81489-12ee-4a9e-aaae-a2591f45987d"  # Microsoft first-party Dataverse client
+CLIENT_ID = "51f81489-12ee-4a9e-aaae-a2591f45987d"
 AUTHORITY = "https://login.microsoftonline.com/organizations"
 
 API_SECRET_KEY = os.environ.get("API_SECRET_KEY", "nbpharma-ims-poc-2025")
@@ -62,7 +39,6 @@ TABLE_SKU_BATCHES = "ma_imsskubatches"
 TABLE_DISTRIBUTORS = "ma_distributors"
 TABLE_PRODUCTS = "ma_imsproducts"
 
-# Unicare Material Code → NBPharma mapping
 UNICARE_PRODUCT_MAP = {
     "U190001": {"nbp_desc": "CIMZIA 200mg/ml 2 Prefilled Syringes ME", "brand": "CIMZIA"},
     "U190003": {"nbp_desc": "Orladeyo 150mg Caps 28's US1", "brand": "ORLADEYO"},
@@ -70,53 +46,31 @@ UNICARE_PRODUCT_MAP = {
     "U190005": {"nbp_desc": "Bimzelx Inj 160mg/ml 2 Prefilled Injectors ME1", "brand": "BIMZELX"},
 }
 
-# =============================================================================
-# LOGGING
-# =============================================================================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 # =============================================================================
-# FLASK APP
-# =============================================================================
-app = Flask(__name__)
-
-
-# =============================================================================
-# AUTH — Client Credentials (headless, no browser)
+# AUTH
 # =============================================================================
 _token_cache = {"token": None, "expires_at": 0}
 
 
 def get_token():
-    """Acquire token using refresh token (no App Registration needed)."""
     now = time.time()
     if _token_cache["token"] and _token_cache["expires_at"] > now + 60:
         return _token_cache["token"]
 
     if not REFRESH_TOKEN:
-        raise Exception(
-            "REFRESH_TOKEN env var not set. "
-            "Run get_refresh_token.py locally and paste the token into Render."
-        )
+        raise Exception("REFRESH_TOKEN env var not set.")
 
-    app_client = msal.PublicClientApplication(
-        client_id=CLIENT_ID,
-        authority=AUTHORITY,
-    )
-
-    result = app_client.acquire_token_by_refresh_token(
-        refresh_token=REFRESH_TOKEN,
-        scopes=SCOPES,
-    )
+    app_client = msal.PublicClientApplication(client_id=CLIENT_ID, authority=AUTHORITY)
+    result = app_client.acquire_token_by_refresh_token(refresh_token=REFRESH_TOKEN, scopes=SCOPES)
 
     if "access_token" in result:
         _token_cache["token"] = result["access_token"]
         _token_cache["expires_at"] = now + result.get("expires_in", 3600)
-        log.info("✅ Token acquired via refresh token")
         return result["access_token"]
 
-    log.error(f"❌ Auth failed: {result.get('error_description', 'Unknown')}")
     raise Exception(f"Auth failed: {result.get('error_description', 'Unknown')}")
 
 
@@ -145,14 +99,6 @@ def resolve_odata_set(logical_name):
         if resp.status_code == 200:
             _odata_cache[logical_name] = candidate
             return candidate
-    url = f"{API_URL}/EntityDefinitions?$filter=LogicalName eq '{logical_name}'&$select=EntitySetName"
-    resp = http_requests.get(url, headers=get_headers(), timeout=15)
-    if resp.status_code == 200:
-        entities = resp.json().get("value", [])
-        if entities:
-            sn = entities[0].get("EntitySetName")
-            _odata_cache[logical_name] = sn
-            return sn
     return f"{logical_name}s"
 
 
@@ -185,7 +131,7 @@ def safe_payload(payload, valid_columns):
 
 
 # =============================================================================
-# FILE PARSERS
+# PARSERS
 # =============================================================================
 
 def parse_closing_stock(file_bytes):
@@ -210,13 +156,10 @@ def parse_closing_stock(file_bytes):
         expiry = row[6]
         expiry_str = expiry.strftime("%Y-%m-%d") if isinstance(expiry, datetime) else (str(expiry)[:10] if expiry else None)
         batches[batch_nb] = {
-            "material": material,
-            "description": str(row[1] or ""),
+            "material": material, "description": str(row[1] or ""),
             "opening": int(row[7]) if row[7] is not None else 0,
             "closing": int(row[8]) if row[8] is not None else 0,
-            "expiry": expiry_str,
-            "month": month,
-            "year": year,
+            "expiry": expiry_str, "month": month, "year": year,
             "nbp_info": UNICARE_PRODUCT_MAP.get(material, {}),
         }
     wb.close()
@@ -243,7 +186,6 @@ def parse_mtd_sales(file_bytes):
 
 
 def detect_file_type(filename):
-    """Detect if file is Closing Stock or MTD Sales by filename patterns."""
     fn = filename.lower()
     if "closing" in fn or "stock" in fn:
         return "closing_stock"
@@ -253,46 +195,27 @@ def detect_file_type(filename):
 
 
 # =============================================================================
-# CORE PROCESSING LOGIC
+# CORE PROCESSING
 # =============================================================================
 
 def process_files(files_dict):
-    """
-    Process uploaded files and push to Dataverse.
-    files_dict: {"closing_stock": bytes, "mtd_sales": bytes}
-    Returns summary dict.
-    """
-    results = {
-        "status": "processing",
-        "steps": [],
-        "patched": 0,
-        "created": 0,
-        "failed": 0,
-        "errors": [],
-    }
+    results = {"status": "processing", "steps": [], "patched": 0, "created": 0, "failed": 0, "errors": []}
 
     try:
-        # Step 1: Parse files
-        stock_data = {}
-        mtd_data = {}
+        stock_data = parse_closing_stock(files_dict["closing_stock"]) if "closing_stock" in files_dict else {}
+        mtd_data = parse_mtd_sales(files_dict["mtd_sales"]) if "mtd_sales" in files_dict else {}
 
-        if "closing_stock" in files_dict:
-            stock_data = parse_closing_stock(files_dict["closing_stock"])
+        if stock_data:
             results["steps"].append(f"Parsed {len(stock_data)} batches from Closing Stock")
-
-        if "mtd_sales" in files_dict:
-            mtd_data = parse_mtd_sales(files_dict["mtd_sales"])
+        if mtd_data:
             results["steps"].append(f"Parsed {len(mtd_data)} batches from MTD Sales")
 
         all_batch_numbers = set(stock_data.keys()) | set(mtd_data.keys())
         if not all_batch_numbers:
             results["status"] = "error"
-            results["errors"].append("No batch data found in uploaded files")
+            results["errors"].append("No batch data found")
             return results
 
-        results["steps"].append(f"Combined: {len(all_batch_numbers)} unique batches")
-
-        # Step 2: Resolve Dataverse lookups
         batch_set = resolve_odata_set(TABLE_SKU_BATCHES)
         dist_set = resolve_odata_set(TABLE_DISTRIBUTORS)
         prod_set = resolve_odata_set(TABLE_PRODUCTS)
@@ -303,43 +226,34 @@ def process_files(files_dict):
         dist_guid = None
         if resp.status_code == 200 and resp.json().get("value"):
             dist_guid = resp.json()["value"][0]["ma_distributorsid"]
-            results["steps"].append(f"Distributor: Unicare → {dist_guid[:8]}...")
 
         if not dist_guid:
             results["status"] = "error"
-            results["errors"].append("Unicare distributor not found in Dataverse")
+            results["errors"].append("Unicare not found")
             return results
 
         # Lookup products
         resp = http_requests.get(f"{API_URL}/{prod_set}?$top=5000", headers=get_headers(), timeout=30)
         all_products = resp.json().get("value", []) if resp.status_code == 200 else []
 
-        def find_product_guid(brand_name):
-            brand_lower = brand_name.lower()
+        brand_guids = {}
+        for info in UNICARE_PRODUCT_MAP.values():
+            brand_lower = info["brand"].lower()
             for p in all_products:
                 for k, v in p.items():
                     if k.startswith("ma_") and isinstance(v, str) and brand_lower in v.lower():
-                        return p["ma_imsproductsid"]
-            return None
+                        brand_guids[info["brand"]] = p["ma_imsproductsid"]
+                        break
+                if info["brand"] in brand_guids:
+                    break
 
-        brand_guids = {}
-        for mat_code, info in UNICARE_PRODUCT_MAP.items():
-            guid = find_product_guid(info["brand"])
-            if guid:
-                brand_guids[info["brand"]] = guid
-
-        results["steps"].append(f"Products resolved: {len(brand_guids)} brands")
-
-        # Step 3: Discover valid columns
         valid_columns, primary_name = discover_valid_columns(TABLE_SKU_BATCHES)
 
-        # Step 4: Find existing batches in Dataverse
+        # Find existing vs missing
         found_batches = {}
         missing_batches = []
-
         for batch_nb in sorted(all_batch_numbers):
-            filter_str = f"ma_batchnb eq '{batch_nb}'"
-            url = f"{API_URL}/{batch_set}?$filter={filter_str}&$top=100"
+            url = f"{API_URL}/{batch_set}?$filter=ma_batchnb eq '{batch_nb}'&$top=100"
             resp = http_requests.get(url, headers=get_headers(), timeout=15)
             if resp.status_code == 200:
                 records = resp.json().get("value", [])
@@ -349,9 +263,6 @@ def process_files(files_dict):
                     missing_batches.append(batch_nb)
             time.sleep(0.05)
 
-        results["steps"].append(f"PATCH: {len(found_batches)} existing | CREATE: {len(missing_batches)} new")
-
-        # Step 5: Build and execute updates
         def build_payload(batch_nb):
             payload = {
                 "ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})",
@@ -369,7 +280,7 @@ def process_files(files_dict):
                 if sd["expiry"]:
                     payload["ma_expirydate"] = sd["expiry"]
                 brand = nbp_info.get("brand", "")
-                if brand and brand in brand_guids:
+                if brand in brand_guids:
                     payload["ma_Product@odata.bind"] = f"/{prod_set}({brand_guids[brand]})"
             elif batch_nb in mtd_data:
                 md = mtd_data[batch_nb]
@@ -380,11 +291,11 @@ def process_files(files_dict):
                 if md["expiry"]:
                     payload["ma_expirydate"] = md["expiry"]
                 brand = md.get("brand", "")
-                if brand and brand in brand_guids:
+                if brand in brand_guids:
                     payload["ma_Product@odata.bind"] = f"/{prod_set}({brand_guids[brand]})"
             return payload
 
-        # Execute PATCHes
+        # PATCHes
         for batch_nb, records in found_batches.items():
             payload = safe_payload(build_payload(batch_nb), valid_columns)
             for rec in records:
@@ -399,7 +310,7 @@ def process_files(files_dict):
                     results["errors"].append(f"PATCH {batch_nb}: {resp.status_code}")
                 time.sleep(0.1)
 
-        # Execute CREATEs
+        # CREATEs
         for batch_nb in missing_batches:
             payload = build_payload(batch_nb)
             payload["ma_batchnb"] = batch_nb
@@ -410,124 +321,97 @@ def process_files(files_dict):
                 brand = mtd_data[batch_nb].get("brand", "")
             if primary_name:
                 payload[primary_name] = f"{brand}_{batch_nb}_UNI_{payload.get('ma_year', 2025)}-{payload.get('ma_month', 9):02d}"
-
             payload = safe_payload(payload, valid_columns)
-
-            resp = http_requests.post(
-                f"{API_URL}/{batch_set}",
-                headers=get_headers(), json=payload, timeout=30,
-            )
+            resp = http_requests.post(f"{API_URL}/{batch_set}", headers=get_headers(), json=payload, timeout=30)
             if resp.status_code in (200, 201, 204):
                 results["created"] += 1
             else:
                 results["failed"] += 1
-                results["errors"].append(f"CREATE {batch_nb}: {resp.status_code} {resp.text[:200]}")
+                results["errors"].append(f"CREATE {batch_nb}: {resp.status_code}")
             time.sleep(0.1)
 
         results["status"] = "success"
-        results["steps"].append(f"Done: {results['patched']} patched, {results['created']} created, {results['failed']} failed")
+        results["steps"].append(f"Done: {results['patched']} patched, {results['created']} created")
 
     except Exception as e:
         results["status"] = "error"
         results["errors"].append(str(e))
-        log.exception("Processing failed")
 
     return results
 
 
 # =============================================================================
-# ROUTES
+# VERCEL HANDLER (Flask-like routing via BaseHTTPRequestHandler)
 # =============================================================================
 
+from flask import Flask, request as flask_request, jsonify
+
+app = Flask(__name__)
+
+
 @app.route("/", methods=["GET"])
-def health():
+def index():
     return jsonify({
         "service": "NBPharma IMS Batch Enrichment",
         "status": "running",
-        "version": "1.0.0",
         "endpoints": {
-            "POST /process": "Upload Closing Stock + MTD Sales Excel files",
-            "GET /health": "Health check",
+            "POST /api/process": "Upload Excel files",
+            "GET /api/health": "Health check",
         },
     })
 
 
-@app.route("/health", methods=["GET"])
-def health_check():
-    # Verify Dataverse connectivity
+@app.route("/api/health", methods=["GET"])
+def health():
     try:
-        token = get_token()
+        get_token()
         resp = http_requests.get(f"{API_URL}/WhoAmI", headers=get_headers(), timeout=10)
         connected = resp.status_code == 200
     except Exception:
         connected = False
-
-    return jsonify({
-        "status": "healthy" if connected else "degraded",
-        "dataverse_connected": connected,
-        "dataverse_url": DATAVERSE_URL,
-    })
+    return jsonify({"status": "healthy" if connected else "degraded", "dataverse_connected": connected})
 
 
-@app.route("/process", methods=["POST"])
-def process_endpoint():
-    """
-    Accept Excel file(s) and process them.
-    
-    Usage from Power Automate:
-      POST /process
-      Headers: X-API-Key: <your-secret>
-      Body: multipart/form-data with file(s)
-      
-    File detection is automatic by filename:
-      - *closing*/*stock* → Closing Stock Report
-      - *mtd*/*sales*    → MTD Sales Report
-    """
-    # Auth check
-    api_key = request.headers.get("X-API-Key", "")
+@app.route("/api/process", methods=["POST"])
+def process():
+    api_key = flask_request.headers.get("X-API-Key", "")
     if api_key != API_SECRET_KEY:
-        return jsonify({"error": "Unauthorized. Provide X-API-Key header."}), 401
+        return jsonify({"error": "Unauthorized"}), 401
 
-    if not request.files:
-        return jsonify({"error": "No files uploaded. Send Excel files as multipart/form-data."}), 400
+    if not flask_request.files and not flask_request.data:
+        return jsonify({"error": "No files uploaded"}), 400
 
-    # Collect files
     files_dict = {}
     file_info = []
 
-    for key in request.files:
-        f = request.files[key]
-        filename = f.filename or key
-        file_bytes = f.read()
+    # Handle multipart form data
+    if flask_request.files:
+        for key in flask_request.files:
+            f = flask_request.files[key]
+            filename = f.filename or key
+            file_bytes = f.read()
+            file_type = detect_file_type(filename)
+            file_info.append({"name": filename, "type": file_type, "size": len(file_bytes)})
+            if file_type in ("closing_stock", "mtd_sales"):
+                files_dict[file_type] = file_bytes
+            else:
+                files_dict.setdefault("closing_stock", file_bytes)
+
+    # Handle raw binary with filename in header
+    elif flask_request.data:
+        filename = flask_request.headers.get("X-Filename", "file.xlsx")
+        file_bytes = flask_request.data
         file_type = detect_file_type(filename)
-
         file_info.append({"name": filename, "type": file_type, "size": len(file_bytes)})
-
-        if file_type == "closing_stock":
-            files_dict["closing_stock"] = file_bytes
-        elif file_type == "mtd_sales":
-            files_dict["mtd_sales"] = file_bytes
+        if file_type in ("closing_stock", "mtd_sales"):
+            files_dict[file_type] = file_bytes
         else:
-            # Try to detect from content
-            files_dict.setdefault("closing_stock", file_bytes)
+            files_dict["closing_stock"] = file_bytes
 
-    log.info(f"📩 Received {len(file_info)} files: {file_info}")
-
-    if not files_dict:
-        return jsonify({"error": "Could not detect file types. Name files with 'closing'/'stock' or 'mtd'/'sales'."}), 400
-
-    # Process
     results = process_files(files_dict)
     results["files_received"] = file_info
-
-    status_code = 200 if results["status"] == "success" else 500
-    return jsonify(results), status_code
+    return jsonify(results), 200 if results["status"] == "success" else 500
 
 
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+# Vercel expects this
+handler = app
