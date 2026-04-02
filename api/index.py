@@ -129,6 +129,119 @@ def find_product_guid(brand_name, all_products):
                 return p["ma_imsproductsid"]
     return None
 
+
+def match_product_dynamically(product_desc, all_products):
+    """Match a product description from file against ma_imsproducts.
+    Uses keyword overlap scoring — works across different distributor naming conventions."""
+    if not product_desc:
+        return None, None
+
+    desc_upper = product_desc.upper()
+    desc_words = set(desc_upper.replace(",", " ").replace("-", " ").replace("'", "").split())
+    # Remove very short/common words
+    desc_words = {w for w in desc_words if len(w) >= 3 and w not in {"THE", "FOR", "AND", "MG/ML"}}
+
+    best_guid = None
+    best_name = None
+    best_score = 0
+
+    for p in all_products:
+        for field in ["ma_sku", "ma_productid", "ma_productname", "ma_name"]:
+            pname = p.get(field)
+            if not pname or not isinstance(pname, str):
+                continue
+            pname_upper = pname.upper()
+            pname_words = set(pname_upper.replace(",", " ").replace("-", " ").replace("'", "").split())
+            pname_words = {w for w in pname_words if len(w) >= 3}
+
+            if not pname_words:
+                continue
+
+            overlap = desc_words & pname_words
+            if not overlap:
+                continue
+
+            # Score: overlap ratio + bonus for first word (brand name) match
+            score = len(overlap) / max(len(desc_words | pname_words), 1)
+            # Big bonus if the first significant word matches (brand name)
+            first_word = desc_upper.split()[0] if desc_upper.split() else ""
+            if first_word in pname_upper:
+                score += 0.5
+
+            if score > best_score:
+                best_score = score
+                best_guid = p["ma_imsproductsid"]
+                best_name = pname
+
+    if best_score >= 0.3:  # threshold
+        return best_guid, best_name
+    return None, None
+
+
+def parse_distributor_from_subject(subject):
+    """Extract distributor name from email subject.
+    Expected format: 'MTD Sales Report - Unicare - November 2025'
+    or 'Closing Stock - MPC - September 2025'"""
+    if not subject:
+        return None
+    # Split by common delimiters
+    parts = [p.strip() for p in subject.replace("–", "-").split("-")]
+    # Remove known non-distributor parts
+    skip_words = {"mtd", "sales", "report", "closing", "stock", "monthly", "product",
+                  "january", "february", "march", "april", "may", "june", "july",
+                  "august", "september", "october", "november", "december",
+                  "2024", "2025", "2026", "2027"}
+    for part in parts:
+        words = part.lower().split()
+        if words and not all(w in skip_words for w in words):
+            # This part likely contains the distributor name
+            if len(part) > 2 and part.lower() not in skip_words:
+                return part
+    return None
+
+
+def lookup_distributor(name_hint):
+    """Lookup distributor by name. Returns (guid, name) or (None, None)."""
+    dist_set = resolve_odata_set(TABLE_DISTRIBUTORS)
+
+    if name_hint:
+        # Try exact search first
+        params = {"$filter": f"contains(ma_distributorname,'{name_hint}')", "$top": 5}
+        resp = http_requests.get(f"{API_URL}/{dist_set}", headers=get_headers(), params=params, timeout=15)
+        if resp.status_code == 200 and resp.json().get("value"):
+            rec = resp.json()["value"][0]
+            return rec["ma_distributorsid"], rec["ma_distributorname"]
+
+    # Fallback: try "Unicare"
+    params = {"$filter": "contains(ma_distributorname,'Unicare')", "$top": 5}
+    resp = http_requests.get(f"{API_URL}/{dist_set}", headers=get_headers(), params=params, timeout=15)
+    if resp.status_code == 200 and resp.json().get("value"):
+        rec = resp.json()["value"][0]
+        return rec["ma_distributorsid"], rec["ma_distributorname"]
+
+    return None, None
+
+
+def parse_expiry_string(val):
+    """Parse expiry date from various formats to YYYY-MM-DD."""
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val.strftime("%Y-%m-%d")
+    s = str(val).strip()
+    # Try dd.mm.yyyy
+    if "." in s:
+        try:
+            parts = s.split(".")
+            if len(parts) == 3:
+                return f"{parts[2]}-{parts[1]}-{parts[0]}"
+        except (IndexError, ValueError):
+            pass
+    # Try yyyy-mm-dd (already correct)
+    if len(s) >= 10 and s[4] == "-":
+        return s[:10]
+    return None
+
 # ── DYNAMIC COLUMN MAPPER ──
 # Auto-detects column positions from headers — works with ANY distributor template
 
@@ -317,6 +430,18 @@ def parse_mtd_sales(file_bytes):
             exp = get_col(row, col, "expiry")
             if exp and isinstance(exp, datetime):
                 batches[batch]["expiry"] = exp.strftime("%Y-%m-%d")
+            elif exp and isinstance(exp, str):
+                try:
+                    parts = exp.strip().split(".")
+                    if len(parts) == 3:
+                        batches[batch]["expiry"] = f"{parts[2]}-{parts[1]}-{parts[0]}"
+                except (IndexError, ValueError):
+                    pass
+            # Detect month/year from transaction date
+            m, y = detect_month_year(row, col)
+            if m and y:
+                batches[batch]["month"] = m
+                batches[batch]["year"] = y
 
         # FOC detection: explicit FOC column OR billing type
         is_foc = foc > 0 or billt in ("ZRE5", "ZUFA")
@@ -339,6 +464,12 @@ def parse_mtd_sales(file_bytes):
 
         product_metrics[brand]["total_qty"] += qty
         product_metrics[brand]["total_val"] += val
+        # Store month/year from first transaction
+        if "month" not in product_metrics[brand] or not product_metrics[brand].get("month"):
+            m, y = detect_month_year(row, col)
+            if m and y:
+                product_metrics[brand]["month"] = m
+                product_metrics[brand]["year"] = y
     wb.close()
     return dict(batches), dict(product_metrics)
 
@@ -353,8 +484,10 @@ def detect_file_type(filename):
 # ── PIPELINE A: ENRICH BATCHES ──
 
 def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
-                            batch_set, dist_set, prod_set, valid_columns, primary_name):
+                            batch_set, dist_set, prod_set, valid_columns, primary_name, all_products=None):
     results = {"patched": 0, "created": 0, "failed": 0, "errors": []}
+    if all_products is None:
+        all_products = []
     all_batch_numbers = set(stock_batches.keys()) | set(mtd_batches.keys())
     if not all_batch_numbers:
         return results
@@ -381,18 +514,32 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
             if nbp_info:
                 payload["ma_itemno"] = nbp_info["nbp_desc"]
             if sd.get("expiry"):
-                payload["ma_expirydate"] = sd["expiry"]
+                exp = parse_expiry_string(sd["expiry"])
+                if exp:
+                    payload["ma_expirydate"] = exp
             brand = nbp_info.get("brand", "")
             if brand in brand_guids:
                 payload["ma_Product@odata.bind"] = f"/{prod_set}({brand_guids[brand]})"
         elif batch_nb in mtd_batches:
             md = mtd_batches[batch_nb]
-            payload.update({"ma_month": 9, "ma_year": 2025, "ma_quantity": max(0, int(md["qty"])), "ma_itemno": md["name"]})
+            # Detect month/year from batch data dates or default
+            b_month = md.get("month", 0)
+            b_year = md.get("year", 0)
+            if not b_month or not b_year:
+                b_month, b_year = 9, 2025  # fallback
+            payload.update({"ma_month": b_month, "ma_year": b_year, "ma_quantity": max(0, int(md["qty"])), "ma_itemno": md["name"]})
             if md.get("expiry"):
-                payload["ma_expirydate"] = md["expiry"]
+                exp = parse_expiry_string(md["expiry"])
+                if exp:
+                    payload["ma_expirydate"] = exp
             brand = md.get("brand", "")
             if brand in brand_guids:
                 payload["ma_Product@odata.bind"] = f"/{prod_set}({brand_guids[brand]})"
+            elif md.get("name"):
+                # Try dynamic match by product description
+                guid, _ = match_product_dynamically(md["name"], all_products)
+                if guid:
+                    payload["ma_Product@odata.bind"] = f"/{prod_set}({guid})"
         return payload
 
     for batch_nb, records in found_batches.items():
@@ -489,12 +636,20 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
             add_metric(brand, "stock_close", vals["closing"], month, year)
 
     if file_type == "mtd_sales" and mtd_product_metrics:
+        # Detect month/year from the data (use first batch's date or fallback)
+        detected_month, detected_year = 9, 2025
+        # Check if parse returned month/year info
         for brand, v in mtd_product_metrics.items():
-            add_metric(brand, "private_sales", v["private_qty"], 9, 2025)
-            add_metric(brand, "tender_sales", v["tender_qty"], 9, 2025)
-            add_metric(brand, "ims_total_qty", v["total_qty"], 9, 2025)
-            add_metric(brand, "foc_samples", v["foc_qty"], 9, 2025)
-            add_metric(brand, "total_non_sales", v["foc_qty"], 9, 2025)
+            if v.get("month") and v.get("year"):
+                detected_month = v["month"]
+                detected_year = v["year"]
+                break
+        for brand, v in mtd_product_metrics.items():
+            add_metric(brand, "private_sales", v["private_qty"], detected_month, detected_year)
+            add_metric(brand, "tender_sales", v["tender_qty"], detected_month, detected_year)
+            add_metric(brand, "ims_total_qty", v["total_qty"], detected_month, detected_year)
+            add_metric(brand, "foc_samples", v["foc_qty"], detected_month, detected_year)
+            add_metric(brand, "total_non_sales", v["foc_qty"], detected_month, detected_year)
 
     log.info(f"Prepared {len(records)} metric records for ma_imsproductdata")
 
@@ -726,7 +881,7 @@ def pipeline_track_import(file_type, filename, dist_guid, dist_set, total_rows, 
 
 # ── MAIN PROCESSING ──
 
-def process_file(file_type, file_bytes):
+def process_file(file_type, file_bytes, distributor_hint=None):
     results = {"status": "processing", "file_type": file_type, "steps": [],
         "batches_patched": 0, "batches_created": 0,
         "metrics_created": 0, "metrics_updated": 0, "raw_created": 0,
@@ -745,35 +900,50 @@ def process_file(file_type, file_bytes):
         dist_set = resolve_odata_set(TABLE_DISTRIBUTORS)
         prod_set = resolve_odata_set(TABLE_PRODUCTS)
 
-        params = {"$filter": "contains(ma_distributorname,'Unicare')", "$top": 5}
-        resp = http_requests.get(f"{API_URL}/{dist_set}", headers=get_headers(), params=params, timeout=15)
-        dist_guid = None
-        if resp.status_code == 200 and resp.json().get("value"):
-            dist_guid = resp.json()["value"][0]["ma_distributorsid"]
+        # Dynamic distributor lookup (from email subject or fallback)
+        dist_guid, dist_name = lookup_distributor(distributor_hint)
         if not dist_guid:
             results["status"] = "error"
-            results["errors"].append("Unicare not found")
+            results["errors"].append(f"Distributor not found: {distributor_hint}")
             return results
+        results["steps"].append(f"Distributor: {dist_name}")
 
+        # Load all products for dynamic matching
         resp = http_requests.get(f"{API_URL}/{prod_set}?$top=5000", headers=get_headers(), timeout=30)
         all_products = resp.json().get("value", []) if resp.status_code == 200 else []
+
+        # Dynamic product matching — match by brand AND by product description
         brand_guids = {}
+        # First: try known brand mappings
         for info in UNICARE_PRODUCT_MAP.values():
             guid = find_product_guid(info["brand"], all_products)
             if guid:
                 brand_guids[info["brand"]] = guid
+
+        # Second: match product descriptions from MTD data dynamically
         for brand in mtd_product_metrics.keys():
             if brand not in brand_guids:
-                guid = find_product_guid(brand, all_products)
+                guid, matched_name = match_product_dynamically(brand, all_products)
                 if guid:
                     brand_guids[brand] = guid
-        results["steps"].append(f"Resolved: Unicare + {len(brand_guids)} products")
+                    log.info(f"Dynamic match: '{brand}' → '{matched_name}'")
+
+        # Third: match from batch data product names
+        for batch_nb, bd in {**stock_batches, **mtd_batches}.items():
+            product_name = bd.get("name") or bd.get("description", "")
+            brand = bd.get("brand", "")
+            if brand and brand not in brand_guids and product_name:
+                guid, matched_name = match_product_dynamically(product_name, all_products)
+                if guid:
+                    brand_guids[brand] = guid
+
+        results["steps"].append(f"Products matched: {len(brand_guids)} ({', '.join(brand_guids.keys())})")
 
         valid_columns, primary_name = discover_valid_columns(TABLE_SKU_BATCHES)
 
         # PIPELINE A: Enrich batches
         br = pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
-            batch_set, dist_set, prod_set, valid_columns, primary_name)
+            batch_set, dist_set, prod_set, valid_columns, primary_name, all_products)
         results["batches_patched"] = br["patched"]
         results["batches_created"] = br["created"]
         results["failed"] += br["failed"]
@@ -842,6 +1012,11 @@ def process():
     if not flask_request.files and not flask_request.data:
         return jsonify({"error": "No files uploaded"}), 400
 
+    # Extract distributor hint from email subject (sent by Power Automate)
+    email_subject = flask_request.headers.get("X-Email-Subject", "")
+    distributor_hint = parse_distributor_from_subject(email_subject)
+    log.info(f"Email subject: '{email_subject}' → distributor: '{distributor_hint}'")
+
     def is_excel(fn):
         return fn.lower().endswith((".xlsx", ".xls", ".xlsm"))
 
@@ -870,7 +1045,7 @@ def process():
     all_results = []
     for ft, fb, fn in files_to_process:
         log.info(f"Processing: {fn} as {ft}")
-        result = process_file(ft, fb)
+        result = process_file(ft, fb, distributor_hint=distributor_hint)
         result["filename"] = fn
         all_results.append(result)
 
