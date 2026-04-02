@@ -827,13 +827,25 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
         if "ma_isfoc" in raw_columns:
             payload["ma_isfoc"] = foc > 0 or billt in ("ZRE5", "ZUFA")
 
-        # Primary name: transactionid
+        # Primary name: transactionid (used for dedup)
         if raw_primary:
             sales_doc = get_col_str(row, col, "sales_doc") or str(row_count)
             cust_code = get_col_str(row, col, "customer_code") or ""
-            payload[raw_primary] = f"TX-{sales_doc}-{cust_code}-{year}-{month:02d}"
+            tx_id = f"TX-{sales_doc}-{cust_code}-{year}-{month:02d}"
+            payload[raw_primary] = tx_id
 
         clean = safe_payload(payload, raw_columns)
+
+        # DEDUP: check if this transaction already exists
+        if raw_primary and tx_id:
+            check_filter = f"{raw_primary} eq '{tx_id}'"
+            check_url = f"{API_URL}/{raw_set}?$filter={check_filter}&$top=1&$select={raw_primary}"
+            check_resp = http_requests.get(check_url, headers=get_headers(), timeout=10)
+            if check_resp.status_code == 200 and check_resp.json().get("value"):
+                results.setdefault("raw_skipped", 0)
+                results["raw_skipped"] += 1
+                continue  # Already exists, skip
+
         resp = http_requests.post(f"{API_URL}/{raw_set}", headers=get_headers(), json=clean, timeout=30)
         if resp.status_code in (200, 201, 204):
             results["raw_created"] += 1
@@ -902,12 +914,115 @@ def pipeline_track_import(file_type, filename, dist_guid, dist_set, total_rows, 
 
     return results
 
+# ── PIPELINE E: UPDATE PRODUCT ITEM CODES (ma_imsproductitemcodes) ──
+
+def pipeline_update_item_codes(file_type, file_bytes, dist_guid, brand_guids, dist_set, prod_set, all_products):
+    """Extract unique item codes from file and create/update ma_imsproductitemcodes.
+    Maps distributor item codes → products dynamically."""
+    results = {"itemcodes_created": 0, "itemcodes_updated": 0, "itemcodes_skipped": 0, "errors": []}
+
+    try:
+        ic_set = resolve_odata_set("ma_imsproductitemcodes")
+    except Exception:
+        results["errors"].append("ma_imsproductitemcodes table not accessible")
+        return results
+
+    ic_columns, ic_primary = discover_valid_columns("ma_imsproductitemcodes")
+    if not ic_columns:
+        results["errors"].append("Could not discover item codes columns")
+        return results
+
+    # Parse file to extract unique item code → description pairs
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+    ws = wb.active
+    headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    col = auto_map_columns(headers)
+
+    unique_items = {}  # {item_code: product_description}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        item_code = get_col_str(row, col, "material_code")
+        product_desc = get_col_str(row, col, "product_name")
+        if item_code and product_desc and item_code not in unique_items:
+            unique_items[item_code] = product_desc
+    wb.close()
+
+    log.info(f"Item codes: {len(unique_items)} unique codes found")
+
+    for item_code, product_desc in unique_items.items():
+        # Check if this item code already exists for this distributor
+        filter_str = (f"ma_itemcode eq '{item_code}'"
+                      f" and _ma_distributor_value eq {dist_guid}")
+        check_url = f"{API_URL}/{ic_set}?$filter={filter_str}&$top=1"
+        check_resp = http_requests.get(check_url, headers=get_headers(), timeout=15)
+
+        existing = None
+        if check_resp.status_code == 200:
+            records = check_resp.json().get("value", [])
+            if records:
+                existing = records[0]
+
+        # Match product dynamically
+        product_guid, matched_name = match_product_dynamically(product_desc, all_products)
+
+        # Build payload
+        payload = {
+            "ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})",
+        }
+
+        if "ma_itemcode" in ic_columns:
+            payload["ma_itemcode"] = item_code[:100]
+        if "ma_itemdescription" in ic_columns:
+            payload["ma_itemdescription"] = product_desc[:400]
+        if "ma_isactiveitemcode" in ic_columns:
+            payload["ma_isactiveitemcode"] = True
+
+        # Link to product if matched
+        if product_guid:
+            payload["ma_Product@odata.bind"] = f"/{prod_set}({product_guid})"
+            if "ma_confidence" in ic_columns:
+                payload["ma_confidence"] = 0.85
+        else:
+            if "ma_confidence" in ic_columns:
+                payload["ma_confidence"] = 0.0
+
+        clean = safe_payload(payload, ic_columns)
+
+        if existing:
+            # PATCH existing — update description and product link
+            rec_id = None
+            for k, v in existing.items():
+                if k.startswith("ma_") and k.endswith("id") and k != "ma_itemcode" and v:
+                    rec_id = v
+                    break
+            if rec_id:
+                resp = http_requests.patch(f"{API_URL}/{ic_set}({rec_id})",
+                    headers=get_headers(), json=clean, timeout=30)
+                if resp.status_code in (200, 204):
+                    results["itemcodes_updated"] += 1
+                else:
+                    results["errors"].append(f"ITEMCODE PATCH {item_code}: {resp.status_code}")
+            else:
+                results["itemcodes_skipped"] += 1
+        else:
+            # CREATE new
+            resp = http_requests.post(f"{API_URL}/{ic_set}", headers=get_headers(), json=clean, timeout=30)
+            if resp.status_code in (200, 201, 204):
+                results["itemcodes_created"] += 1
+            else:
+                if len(results["errors"]) < 3:
+                    results["errors"].append(f"ITEMCODE CREATE {item_code}: {resp.status_code} {resp.text[:200]}")
+
+        time.sleep(0.05)
+
+    return results
+
 # ── MAIN PROCESSING ──
 
 def process_file(file_type, file_bytes, distributor_hint=None):
     results = {"status": "processing", "file_type": file_type, "steps": [],
         "batches_patched": 0, "batches_created": 0,
         "metrics_created": 0, "metrics_updated": 0, "raw_created": 0,
+        "itemcodes_created": 0, "itemcodes_updated": 0,
         "failed": 0, "errors": []}
     _start_time = time.time()
     try:
@@ -989,9 +1104,18 @@ def process_file(file_type, file_bytes, distributor_hint=None):
         results["failed"] += rr["raw_failed"]
         results["errors"].extend(rr["errors"])
         if rr["raw_created"] > 0:
-            results["steps"].append(f"Raw Transactions: {rr['raw_created']} rows")
+            results["steps"].append(f"Raw Transactions: {rr['raw_created']} rows{' ('+str(rr.get('raw_skipped',0))+' skipped as duplicates)' if rr.get('raw_skipped') else ''}")
 
-        # PIPELINE D: Track import batch
+        # PIPELINE E: Update product item codes
+        ic = pipeline_update_item_codes(file_type, file_bytes, dist_guid, brand_guids, dist_set, prod_set, all_products)
+        results["itemcodes_created"] = ic["itemcodes_created"]
+        results["itemcodes_updated"] = ic.get("itemcodes_updated", 0)
+        results["errors"].extend(ic["errors"])
+        if ic["itemcodes_created"] > 0 or ic.get("itemcodes_updated", 0) > 0:
+            results["steps"].append(
+                f"Item Codes: {ic['itemcodes_created']} new, {ic.get('itemcodes_updated', 0)} updated in ma_imsproductitemcodes")
+
+        # PIPELINE D: Track import batch (last — captures totals)
         processing_time = time.time() - _start_time
         total_rows = len(stock_batches) + len(mtd_batches) + rr.get("raw_created", 0)
         ir = pipeline_track_import(file_type, results.get("filename", "unknown"),
@@ -999,7 +1123,7 @@ def process_file(file_type, file_bytes, distributor_hint=None):
             br["patched"] + br["created"] + mr["metrics_created"] + mr.get("metrics_updated", 0) + rr["raw_created"],
             results["failed"], processing_time)
         if ir["import_tracked"]:
-            results["steps"].append("Import batch recorded in ma_IMSImportBatches")
+            results["steps"].append("Import batch recorded")
 
         results["status"] = "success"
     except Exception as e:
@@ -1077,6 +1201,7 @@ def process():
     tm = sum(r.get("metrics_created", 0) for r in all_results)
     tu = sum(r.get("metrics_updated", 0) for r in all_results)
     tr = sum(r.get("raw_created", 0) for r in all_results)
+    ti = sum(r.get("itemcodes_created", 0) + r.get("itemcodes_updated", 0) for r in all_results)
     tf = sum(r.get("failed", 0) for r in all_results)
     errs = []
     for r in all_results:
@@ -1089,7 +1214,7 @@ def process():
     response = {"status": st, "summary": {"files_processed": len(files_to_process),
         "batches_patched": tp, "batches_created": tc,
         "metrics_created": tm, "metrics_updated": tu,
-        "raw_transactions": tr, "failed": tf},
+        "raw_transactions": tr, "item_codes": ti, "failed": tf},
         "files": all_results, "errors": errs[:10]}
     return jsonify(response), 200 if st in ("success", "partial") else 500
 
