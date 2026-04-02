@@ -269,33 +269,67 @@ def parse_expiry_string(val):
 # Auto-detects column positions from headers — works with ANY distributor template
 
 COLUMN_RULES = {
-    # field_key: list of header keywords to match (case-insensitive)
     "material_code": ["material", "item number", "item no", "item code", "sku", "product code", "matl"],
-    "product_name": ["material name", "product description", "item description", "description", "product name"],
-    "customer_name": ["ship to name", "customer name", "customer", "sold to name"],
-    "customer_code": ["ship to", "customer id", "customer code", "sold to"],
-    "customer_group": ["customer group", "cust group", "channel"],
-    "region": ["region", "city", "area", "territory"],
-    "salesman": ["salesman", "sales rep", "rep"],
-    "batch": ["batch", "lot", "lot number", "batch number"],
-    "expiry": ["expiry", "exp date", "expiry date", "batch expiry", "best before"],
-    "qty": ["nett sales quantity", "normal qty", "quantity", "sales qty", "base unit quantity", "qty"],
-    "value": ["nett sales value", "net value", "value", "amount", "sales value"],
-    "foc_qty": ["foc qty", "foc quantity", "free goods"],
+    "product_name": ["material name", "product description", "item description", "item name", "description", "product name"],
+    "customer_name": ["ship to name", "customer name", "customer", "sold to name", "sold-to party", "ship-to party"],
+    "customer_code": ["ship to", "customer id", "customer code", "sold to", "sold-to party"],
+    "customer_group": ["customer group", "cust group", "channel", "customer group 1"],
+    "region": ["region", "city", "area", "territory", "sales district"],
+    "salesman": ["salesman", "sales rep", "rep", "sales office"],
+    "batch": ["batch", "lot", "lot number", "batch number", "batch no", "batch no."],
+    "expiry": ["expiry", "exp date", "expiry date", "batch expiry", "best before", "expire date"],
+    "qty": ["nett sales quantity", "normal qty", "salesqty", "total qty", "total batch qty on hand",
+            "quantity", "sales qty", "base unit quantity", "closing stock"],
+    "value": ["nett sales value", "net value", "salesvalue", "value", "amount", "sales value"],
+    "foc_qty": ["foc qty", "foc quantity", "free goods", "focqty", "sum foc"],
     "sample_qty": ["sample qty", "sample quantity"],
     "bill_type": ["billt", "bill. doc. type", "billing type", "doc type"],
-    "bill_date": ["bill date", "billing effective date", "invoice date", "billing date"],
-    "sales_doc": ["sales doc", "sales order", "invoice number", "document number"],
+    "bill_date": ["bill date", "billing effective date", "invoice date", "billing date", "calendar day"],
+    "sales_doc": ["sales doc", "sales order", "invoice number", "document number", "billing document"],
     "bill_doc": ["bill.docs", "billing document", "invoice number"],
     "po_number": ["purchase order", "po number", "cust. reference", "reference"],
     "brand": ["brand", "principal", "manufacturer", "supplier"],
-    "opening": ["opening stock", "opening bal", "opening"],
-    "closing": ["closing stock", "closing bal", "closing"],
+    "opening": ["opening stock", "opening bal", "opening", "sum private stock"],
+    "closing": ["closing stock", "closing bal", "closing", "total batch qty on hand"],
     "from_date": ["from date", "start date", "period start"],
     "to_date": ["to date", "end date", "period end"],
-    "pack_size": ["pack size", "pack", "bun", "uom"],
+    "pack_size": ["pack size", "pack", "bun", "uom", "inventory uom"],
     "unit_price": ["unit price", "price"],
+    "mfg_date": ["manufacture date", "mfg date", "manufacturing date"],
+    "period": ["cal. year / month", "period", "month/year"],
+    "private_qty": ["sum private stock"],
+    "tender_qty": ["sum tender stock"],
 }
+
+
+def detect_header_row(ws, max_scan=25):
+    """Auto-detect which row contains the actual data headers.
+    Returns (header_row_number, headers_list). 1-indexed.
+    Heuristic: the row with the most non-empty cells that look like headers."""
+    best_row = 1
+    best_score = 0
+    best_headers = []
+
+    for i, row in enumerate(ws.iter_rows(min_row=1, max_row=max_scan, values_only=True), start=1):
+        cells = [str(v or "").strip() for v in row]
+        non_empty = [c for c in cells if c and c != "None"]
+        if len(non_empty) < 3:
+            continue
+
+        # Score: more non-empty cells = more likely to be header row
+        score = len(non_empty)
+        # Bonus for known header keywords
+        header_keywords = {"batch", "material", "item", "customer", "qty", "value", "stock",
+                          "date", "product", "sales", "code", "name", "region", "quantity"}
+        keyword_hits = sum(1 for c in non_empty if any(kw in c.lower() for kw in header_keywords))
+        score += keyword_hits * 2
+
+        if score > best_score:
+            best_score = score
+            best_row = i
+            best_headers = cells
+
+    return best_row, best_headers
 
 
 def auto_map_columns(headers):
@@ -355,18 +389,52 @@ def get_col_float(row, mapping, field_key, default=0):
 
 
 def detect_month_year(row, mapping):
-    """Extract month/year from date fields."""
+    """Extract month/year from date fields or period fields."""
+    # Try period field first (e.g., "11.2025" or "Sep-2025")
+    period_val = get_col(row, mapping, "period")
+    if period_val:
+        s = str(period_val).strip()
+        # Format: mm.yyyy or mm/yyyy
+        if "." in s or "/" in s:
+            parts = s.replace("/", ".").split(".")
+            try:
+                if len(parts) == 2:
+                    return int(parts[0]), int(parts[1])
+            except (ValueError, IndexError):
+                pass
+        # Format: Mon-YYYY (e.g., "Sep-2025")
+        month_names = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                       "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+        for mn, mv in month_names.items():
+            if mn in s.lower():
+                for part in s.split("-"):
+                    try:
+                        yr = int(part)
+                        if yr > 2000:
+                            return mv, yr
+                    except ValueError:
+                        continue
+
+    # Try date fields
     for date_field in ["bill_date", "from_date"]:
         val = get_col(row, mapping, date_field)
         if val:
             if isinstance(val, datetime):
                 return val.month, val.year
             s = str(val).strip()
-            # Try dd.mm.yyyy
             if "." in s:
-                parts = s.split(".")
                 try:
-                    return int(parts[1]), int(parts[2])
+                    parts = s.split(".")
+                    if len(parts) == 3:
+                        return int(parts[1]), int(parts[2])
+                except (IndexError, ValueError):
+                    pass
+            # Try mm/dd/yyyy
+            if "/" in s:
+                try:
+                    parts = s.split("/")
+                    if len(parts) == 3:
+                        return int(parts[0]), int(parts[2])
                 except (IndexError, ValueError):
                     pass
     return None, None
@@ -377,13 +445,13 @@ def detect_month_year(row, mapping):
 def parse_closing_stock(file_bytes):
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
     ws = wb.active
-    headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    header_row, headers = detect_header_row(ws)
     col = auto_map_columns(headers)
-    log.info(f"Closing Stock auto-mapped: {col}")
+    log.info(f"Closing Stock: header row={header_row}, auto-mapped={col}")
 
     batches = {}
     product_agg = defaultdict(lambda: {"opening": 0, "closing": 0, "description": "", "month": 9, "year": 2025})
-    for row in ws.iter_rows(min_row=2, values_only=True):
+    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
         material = get_col_str(row, col, "material_code")
         if not material:
             continue
@@ -411,15 +479,32 @@ def parse_closing_stock(file_bytes):
 
 def parse_mtd_sales(file_bytes):
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+    # Try active sheet first, then look for "Table" sheet (SAP BEx reports)
     ws = wb.active
-    headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    header_row, headers = detect_header_row(ws)
+
+    # If active sheet has very few data columns, try "Table" sheet
+    non_empty_headers = [h for h in headers if h.strip()]
+    if len(non_empty_headers) < 5 and "Table" in wb.sheetnames:
+        ws = wb["Table"]
+        header_row, headers = detect_header_row(ws)
+        log.info(f"Switched to 'Table' sheet for data")
+
     col = auto_map_columns(headers)
-    log.info(f"MTD Sales auto-mapped: {col}")
+
+    # For SAP BEx: unnamed columns next to "Material" often contain product description
+    if "material_code" in col and "product_name" not in col:
+        mc_idx = col["material_code"]
+        # Check if the next column has product-like text
+        if mc_idx + 1 < len(headers):
+            col["product_name"] = mc_idx + 1
+
+    log.info(f"MTD Sales: header row={header_row}, auto-mapped={col}")
 
     batches = defaultdict(lambda: {"qty": 0, "value": 0, "material": "", "name": "", "brand": "", "expiry": None})
     product_metrics = defaultdict(lambda: {"private_qty": 0, "private_val": 0, "tender_qty": 0, "tender_val": 0,
                                            "foc_qty": 0, "foc_val": 0, "total_qty": 0, "total_val": 0})
-    for row in ws.iter_rows(min_row=2, values_only=True):
+    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
         # Get product identifier — try brand first, then material name, then material code
         brand = get_col_str(row, col, "brand")
         product_name = get_col_str(row, col, "product_name")
@@ -753,12 +838,20 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
 
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
     ws = wb.active
-    headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    # Try "Table" sheet for SAP BEx reports
+    if "Table" in wb.sheetnames:
+        ws = wb["Table"]
+    header_row, headers = detect_header_row(ws)
     col = auto_map_columns(headers)
-    log.info(f"Raw TX auto-mapped: {col}")
+    # SAP BEx: product description in unnamed column next to material
+    if "material_code" in col and "product_name" not in col:
+        mc_idx = col["material_code"]
+        if mc_idx + 1 < len(headers):
+            col["product_name"] = mc_idx + 1
+    log.info(f"Raw TX: header row={header_row}, auto-mapped: {col}")
     row_count = 0
 
-    for row in ws.iter_rows(min_row=2, values_only=True):
+    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
         product_name = get_col_str(row, col, "product_name")
         if not product_name:
             continue
@@ -935,11 +1028,17 @@ def pipeline_update_item_codes(file_type, file_bytes, dist_guid, brand_guids, di
     # Parse file to extract unique item code → description pairs
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
     ws = wb.active
-    headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+    if "Table" in wb.sheetnames:
+        ws = wb["Table"]
+    header_row, headers = detect_header_row(ws)
     col = auto_map_columns(headers)
+    if "material_code" in col and "product_name" not in col:
+        mc_idx = col["material_code"]
+        if mc_idx + 1 < len(headers):
+            col["product_name"] = mc_idx + 1
 
     unique_items = {}  # {item_code: product_description}
-    for row in ws.iter_rows(min_row=2, values_only=True):
+    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
         item_code = get_col_str(row, col, "material_code")
         product_desc = get_col_str(row, col, "product_name")
         if item_code and product_desc and item_code not in unique_items:
