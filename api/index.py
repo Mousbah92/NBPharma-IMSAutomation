@@ -245,6 +245,25 @@ def lookup_distributor(name_hint):
     return None, None
 
 
+def is_valid_batch(batch_str):
+    """Filter out SAP BEx metadata labels that appear in Batch columns."""
+    if not batch_str or len(batch_str) < 2:
+        return False
+    # SAP BEx metadata labels are NOT batch numbers
+    sap_metadata = {"billing document", "cal. year / month", "calendar day", "calendar year",
+                    "customer group", "customer group 1", "customer group 2", "customer group 3",
+                    "customer group 4", "customer group 5", "delivery", "distribution channel",
+                    "division", "item category", "material group", "material", "sales office",
+                    "sales district", "sold-to party", "ship-to party", "overall result",
+                    "result", "not assigned", "filter"}
+    if batch_str.lower().strip() in sap_metadata:
+        return False
+    # Batch numbers are typically alphanumeric, not long descriptive text
+    if len(batch_str) > 40:
+        return False
+    return True
+
+
 def parse_expiry_string(val):
     """Parse expiry date from various formats to YYYY-MM-DD."""
     if not val:
@@ -465,7 +484,7 @@ def parse_closing_stock(file_bytes):
         opening = int(get_col_float(row, col, "opening", 0))
         closing = int(get_col_float(row, col, "closing", 0))
 
-        if batch_nb:
+        if batch_nb and is_valid_batch(batch_nb):
             batches[batch_nb] = {"material": material, "description": get_col_str(row, col, "product_name"),
                 "opening": opening, "closing": closing, "expiry": expiry_str,
                 "month": month, "year": year, "nbp_info": UNICARE_PRODUCT_MAP.get(material, {})}
@@ -528,8 +547,8 @@ def parse_mtd_sales(file_bytes):
         val = get_col_float(row, col, "value", 0)
         foc = get_col_float(row, col, "foc_qty", 0)
 
-        # Batch-level aggregation
-        if batch:
+        # Batch-level aggregation (skip SAP BEx metadata labels)
+        if batch and is_valid_batch(batch):
             batches[batch]["qty"] += qty
             batches[batch]["value"] += val
             batches[batch]["material"] = material_code
@@ -610,7 +629,7 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
                 found_batches[batch_nb] = records
             else:
                 missing_batches.append(batch_nb)
-        time.sleep(0.05)
+        time.sleep(0.02)
 
     def build_batch_payload(batch_nb):
         payload = {"ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})"}
@@ -660,7 +679,7 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
             else:
                 results["failed"] += 1
                 results["errors"].append(f"PATCH {batch_nb}: {resp.status_code} {resp.text[:300]}")
-            time.sleep(0.1)
+            time.sleep(0.02)
 
     for batch_nb in missing_batches:
         payload = build_batch_payload(batch_nb)
@@ -681,7 +700,7 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
         else:
             results["failed"] += 1
             results["errors"].append(f"CREATE {batch_nb}: {resp.status_code}")
-        time.sleep(0.1)
+        time.sleep(0.02)
     return results
 
 # ── PIPELINE B: UPLOAD PRODUCT METRICS (with dedup) ──
@@ -813,7 +832,7 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
             else:
                 results["metrics_failed"] += 1
                 results["errors"].append(f"METRIC CREATE: {resp.status_code}")
-        time.sleep(0.1)
+        time.sleep(0.02)
     return results
 
 # ── PIPELINE C: UPLOAD RAW TRANSACTIONS (ma_IMSRawTransactions) ──
@@ -877,7 +896,7 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
             "ma_itemdescription": product_name,
             "ma_customername": get_col_str(row, col, "customer_name"),
             "ma_region": get_col_str(row, col, "region"),
-            "ma_batchnumber": get_col_str(row, col, "batch"),
+            "ma_batchnumber": get_col_str(row, col, "batch") if is_valid_batch(get_col_str(row, col, "batch")) else "",
             "ma_billingdocument": get_col_str(row, col, "bill_doc") or get_col_str(row, col, "sales_doc"),
             "ma_ponumber": get_col_str(row, col, "po_number"),
             "ma_sourcefile": "auto_import",
@@ -920,24 +939,14 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
         if "ma_isfoc" in raw_columns:
             payload["ma_isfoc"] = foc > 0 or billt in ("ZRE5", "ZUFA")
 
-        # Primary name: transactionid (used for dedup)
+        # Primary name: transactionid (unique per row)
         if raw_primary:
             sales_doc = get_col_str(row, col, "sales_doc") or str(row_count)
             cust_code = get_col_str(row, col, "customer_code") or ""
-            tx_id = f"TX-{sales_doc}-{cust_code}-{year}-{month:02d}"
+            tx_id = f"TX-{sales_doc}-{cust_code}-{year}-{month:02d}-{row_count}"
             payload[raw_primary] = tx_id
 
         clean = safe_payload(payload, raw_columns)
-
-        # DEDUP: check if this transaction already exists
-        if raw_primary and tx_id:
-            check_filter = f"{raw_primary} eq '{tx_id}'"
-            check_url = f"{API_URL}/{raw_set}?$filter={check_filter}&$top=1&$select={raw_primary}"
-            check_resp = http_requests.get(check_url, headers=get_headers(), timeout=10)
-            if check_resp.status_code == 200 and check_resp.json().get("value"):
-                results.setdefault("raw_skipped", 0)
-                results["raw_skipped"] += 1
-                continue  # Already exists, skip
 
         resp = http_requests.post(f"{API_URL}/{raw_set}", headers=get_headers(), json=clean, timeout=30)
         if resp.status_code in (200, 201, 204):
@@ -949,7 +958,6 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
                 err_text = resp.text[:500] if resp.text else "no response"
                 payload_keys = list(clean.keys())
                 results["errors"].append(f"RAW TX row {row_count}: {resp.status_code} keys={payload_keys} err={err_text}")
-        time.sleep(0.05)
 
     wb.close()
     log.info(f"Raw transactions: {results['raw_created']} created, {results['raw_failed']} failed out of {row_count}")
@@ -1048,9 +1056,8 @@ def pipeline_update_item_codes(file_type, file_bytes, dist_guid, brand_guids, di
     log.info(f"Item codes: {len(unique_items)} unique codes found")
 
     for item_code, product_desc in unique_items.items():
-        # Check if this item code already exists for this distributor
-        filter_str = (f"ma_itemcode eq '{item_code}'"
-                      f" and _ma_distributor_value eq {dist_guid}")
+        # Check if this item code already exists (by item_code only — simpler, more reliable)
+        filter_str = f"ma_itemcode eq '{item_code}'"
         check_url = f"{API_URL}/{ic_set}?$filter={filter_str}&$top=1"
         check_resp = http_requests.get(check_url, headers=get_headers(), timeout=15)
 
@@ -1059,6 +1066,9 @@ def pipeline_update_item_codes(file_type, file_bytes, dist_guid, brand_guids, di
             records = check_resp.json().get("value", [])
             if records:
                 existing = records[0]
+        elif check_resp.status_code == 400:
+            # Filter might fail — try without filter, we'll just create
+            log.warning(f"Item code filter failed for {item_code}, creating new")
 
         # Match product dynamically
         product_guid, matched_name = match_product_dynamically(product_desc, all_products)
@@ -1110,8 +1120,6 @@ def pipeline_update_item_codes(file_type, file_bytes, dist_guid, brand_guids, di
             else:
                 if len(results["errors"]) < 3:
                     results["errors"].append(f"ITEMCODE CREATE {item_code}: {resp.status_code} {resp.text[:200]}")
-
-        time.sleep(0.05)
 
     return results
 
