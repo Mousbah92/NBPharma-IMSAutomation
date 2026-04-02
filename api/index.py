@@ -869,6 +869,7 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
             col["product_name"] = mc_idx + 1
     log.info(f"Raw TX: header row={header_row}, auto-mapped: {col}")
     row_count = 0
+    all_payloads = []
 
     for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
         product_name = get_col_str(row, col, "product_name")
@@ -947,20 +948,66 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
             payload[raw_primary] = tx_id
 
         clean = safe_payload(payload, raw_columns)
-
-        resp = http_requests.post(f"{API_URL}/{raw_set}", headers=get_headers(), json=clean, timeout=30)
-        if resp.status_code in (200, 201, 204):
-            results["raw_created"] += 1
-        else:
-            results["raw_failed"] += 1
-            if results["raw_failed"] <= 3:
-                # Log full error + payload keys for debugging
-                err_text = resp.text[:500] if resp.text else "no response"
-                payload_keys = list(clean.keys())
-                results["errors"].append(f"RAW TX row {row_count}: {resp.status_code} keys={payload_keys} err={err_text}")
+        all_payloads.append(clean)
 
     wb.close()
-    log.info(f"Raw transactions: {results['raw_created']} created, {results['raw_failed']} failed out of {row_count}")
+    log.info(f"Raw transactions: {len(all_payloads)} payloads prepared from {row_count} rows")
+
+    # Submit via $batch API — 50 records per batch request
+    BATCH_SIZE = 50
+    batch_url = f"{API_URL}/$batch"
+
+    for i in range(0, len(all_payloads), BATCH_SIZE):
+        chunk = all_payloads[i:i + BATCH_SIZE]
+        batch_id = f"batch_{i}"
+        changeset_id = f"changeset_{i}"
+
+        body_parts = []
+        body_parts.append(f"--{batch_id}")
+        body_parts.append(f"Content-Type: multipart/mixed; boundary={changeset_id}")
+        body_parts.append("")
+
+        for j, payload in enumerate(chunk):
+            body_parts.append(f"--{changeset_id}")
+            body_parts.append("Content-Type: application/http")
+            body_parts.append("Content-Transfer-Encoding: binary")
+            body_parts.append(f"Content-ID: {i + j + 1}")
+            body_parts.append("")
+            body_parts.append(f"POST {API_URL}/{raw_set} HTTP/1.1")
+            body_parts.append("Content-Type: application/json")
+            body_parts.append("")
+            body_parts.append(json.dumps(payload))
+
+        body_parts.append(f"--{changeset_id}--")
+        body_parts.append(f"--{batch_id}--")
+
+        batch_body = "\r\n".join(body_parts)
+        batch_headers = get_headers()
+        batch_headers["Content-Type"] = f"multipart/mixed; boundary={batch_id}"
+
+        try:
+            resp = http_requests.post(batch_url, headers=batch_headers, data=batch_body, timeout=45)
+            if resp.status_code in (200, 202):
+                # Count successes/failures from response
+                resp_text = resp.text
+                created = resp_text.count('"HTTP/1.1 201') + resp_text.count('"HTTP/1.1 204') + resp_text.count('201 Created') + resp_text.count('204 No Content')
+                if created == 0:
+                    # Fallback: count by absence of errors
+                    errors_in_batch = resp_text.count('"error"')
+                    created = len(chunk) - errors_in_batch
+                results["raw_created"] += max(created, 0)
+                failed_in_batch = len(chunk) - max(created, 0)
+                results["raw_failed"] += max(failed_in_batch, 0)
+            else:
+                results["raw_failed"] += len(chunk)
+                if len(results["errors"]) < 3:
+                    results["errors"].append(f"BATCH {i//BATCH_SIZE}: {resp.status_code} {resp.text[:300]}")
+        except Exception as e:
+            results["raw_failed"] += len(chunk)
+            if len(results["errors"]) < 3:
+                results["errors"].append(f"BATCH {i//BATCH_SIZE} error: {str(e)[:200]}")
+
+    log.info(f"Raw transactions: {results['raw_created']} created, {results['raw_failed']} failed")
     return results
 
 # ── PIPELINE D: TRACK IMPORT BATCH (ma_IMSImportBatches) ──
