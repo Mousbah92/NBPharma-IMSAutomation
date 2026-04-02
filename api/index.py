@@ -178,15 +178,38 @@ def match_product_dynamically(product_desc, all_products):
     return None, None
 
 
+DISTRIBUTOR_CODES = {
+    "UNI": "Unicare",
+    "MPC": "Modern Pharmaceutical",
+    "PTD": "Pharmatrade",
+    "PHL": "Pharmalink",
+    "EBS": "Ebn Sina",
+}
+
+
 def parse_distributor_from_subject(subject):
-    """Extract distributor name from email subject.
-    Expected format: 'MTD Sales Report - Unicare - November 2025'
-    or 'Closing Stock - MPC - September 2025'"""
+    """Extract distributor from email subject.
+    Supports: short codes (PTD, UNI, MPC) or full names.
+    Examples: 'MTD Sales PTD Nov 2025', 'Closing Stock - Unicare - Sep 2025'"""
     if not subject:
         return None
-    # Split by common delimiters
+    subject_upper = subject.upper()
+
+    # Check short codes first
+    for code, name in DISTRIBUTOR_CODES.items():
+        if code in subject_upper.split():
+            return name
+        # Also check with dashes: "MTD-PTD-Nov"
+        if f"-{code}-" in subject_upper or f"-{code} " in subject_upper or f" {code}-" in subject_upper:
+            return name
+
+    # Check full names
+    for code, name in DISTRIBUTOR_CODES.items():
+        if name.upper() in subject_upper:
+            return name
+
+    # Fallback: try splitting by delimiters
     parts = [p.strip() for p in subject.replace("–", "-").split("-")]
-    # Remove known non-distributor parts
     skip_words = {"mtd", "sales", "report", "closing", "stock", "monthly", "product",
                   "january", "february", "march", "april", "may", "june", "july",
                   "august", "september", "october", "november", "december",
@@ -194,9 +217,9 @@ def parse_distributor_from_subject(subject):
     for part in parts:
         words = part.lower().split()
         if words and not all(w in skip_words for w in words):
-            # This part likely contains the distributor name
             if len(part) > 2 and part.lower() not in skip_words:
                 return part
+
     return None
 
 
