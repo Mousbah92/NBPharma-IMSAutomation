@@ -1148,12 +1148,14 @@ def pipeline_update_item_codes(file_type, file_bytes, dist_guid, brand_guids, di
         clean = safe_payload(payload, ic_columns)
 
         if existing:
-            # PATCH existing — update description and product link
-            rec_id = None
-            for k, v in existing.items():
-                if k.startswith("ma_") and k.endswith("id") and k != "ma_itemcode" and v:
-                    rec_id = v
-                    break
+            # PATCH existing — get the entity GUID (ma_imsproductitemcodesid), NOT the autonumber
+            rec_id = existing.get("ma_imsproductitemcodesid")
+            if not rec_id:
+                # Fallback: find any field that's the entity ID (table_name + 'id', not autonumber)
+                for k, v in existing.items():
+                    if k == "ma_imsproductitemcodesid" and v:
+                        rec_id = v
+                        break
             if rec_id:
                 resp = http_requests.patch(f"{API_URL}/{ic_set}({rec_id})",
                     headers=get_headers(), json=clean, timeout=30)
