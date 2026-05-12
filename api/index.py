@@ -570,22 +570,26 @@ def parse_mtd_sales(file_bytes):
                 batches[batch]["month"] = m
                 batches[batch]["year"] = y
 
-        # FOC detection: explicit FOC column OR billing type
-        is_foc = foc > 0 or billt in ("ZRE5", "ZUFA")
+        # Classification rules:
+        # - ZUFA (or explicit foc_qty > 0)  → FOC
+        # - ZRE5                             → RETURN (negative qty, reduces private)
+        # - All other sales                  → PRIVATE MARKET (regardless of customer group)
+        # - Tender: only when explicitly flagged (specific bill types like ZTEN, or future column)
+        # Customer group "Institutional" is NOT tender — it's just a customer category
+        is_foc = (foc > 0) or (billt == "ZUFA")
+        is_return = (billt == "ZRE5")
+        is_tender = billt in ("ZTEN", "ZTND")  # placeholder for future tender bill types
 
         if is_foc:
             product_metrics[brand]["foc_qty"] += abs(foc) if foc > 0 else abs(qty)
             product_metrics[brand]["foc_val"] += abs(val)
             continue
 
-        # Regular sales by customer group
-        if custgroup in ("private", ""):
-            product_metrics[brand]["private_qty"] += qty
-            product_metrics[brand]["private_val"] += val
-        elif custgroup == "institutional":
+        if is_tender:
             product_metrics[brand]["tender_qty"] += qty
             product_metrics[brand]["tender_val"] += val
         else:
+            # ZUCR (normal), ZRE5 (return - keeps negative qty), and all other → PRIVATE
             product_metrics[brand]["private_qty"] += qty
             product_metrics[brand]["private_val"] += val
 
@@ -935,10 +939,10 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
             except (IndexError, ValueError):
                 pass
 
-        # Boolean: FOC flag
+        # Boolean: FOC flag (only ZUFA or explicit foc_qty, NOT ZRE5 which is returns)
         billt = get_col_str(row, col, "bill_type")
         if "ma_isfoc" in raw_columns:
-            payload["ma_isfoc"] = foc > 0 or billt in ("ZRE5", "ZUFA")
+            payload["ma_isfoc"] = foc > 0 or billt == "ZUFA"
 
         # Primary name: transactionid (unique per row)
         if raw_primary:
