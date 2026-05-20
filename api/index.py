@@ -481,15 +481,33 @@ def parse_closing_stock(file_bytes):
 
         expiry = get_col(row, col, "expiry")
         expiry_str = expiry.strftime("%Y-%m-%d") if isinstance(expiry, datetime) else (str(expiry)[:10] if expiry else None)
-        opening = int(get_col_float(row, col, "opening", 0))
-        closing = int(get_col_float(row, col, "closing", 0))
+
+        # Only capture qty values when they're actually present in the source cell.
+        # None signals "not in source" so the payload builder skips the field entirely.
+        def _qty_or_none(field_key):
+            raw = get_col(row, col, field_key, None)
+            if raw is None or str(raw).strip() == "":
+                return None
+            try:
+                return int(float(raw))
+            except (ValueError, TypeError):
+                return None
+
+        opening = _qty_or_none("opening")
+        closing = _qty_or_none("closing")
 
         if batch_nb and is_valid_batch(batch_nb):
-            batches[batch_nb] = {"material": material, "description": get_col_str(row, col, "product_name"),
-                "opening": opening, "closing": closing, "expiry": expiry_str,
-                "month": month, "year": year, "nbp_info": UNICARE_PRODUCT_MAP.get(material, {})}
-        product_agg[material]["opening"] += opening
-        product_agg[material]["closing"] += closing
+            rec = {"material": material, "description": get_col_str(row, col, "product_name"),
+                "expiry": expiry_str, "month": month, "year": year,
+                "nbp_info": UNICARE_PRODUCT_MAP.get(material, {})}
+            if opening is not None:
+                rec["opening"] = opening
+            if closing is not None:
+                rec["closing"] = closing
+            batches[batch_nb] = rec
+        # Aggregation tolerates absent values (treats them as 0 for summing purposes only)
+        product_agg[material]["opening"] += (opening or 0)
+        product_agg[material]["closing"] += (closing or 0)
         product_agg[material]["description"] = get_col_str(row, col, "product_name")
         product_agg[material]["month"] = month
         product_agg[material]["year"] = year
@@ -639,8 +657,14 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
         payload = {"ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})"}
         if batch_nb in stock_batches:
             sd = stock_batches[batch_nb]
-            payload.update({"ma_month": sd.get("month", 9), "ma_year": sd.get("year", 2025),
-                "ma_quantity": max(0, sd["closing"]), "ma_openingqty": max(0, sd["opening"]), "ma_closingqty": max(0, sd["closing"])})
+            payload.update({"ma_month": sd.get("month", 9), "ma_year": sd.get("year", 2025)})
+            # Only set qty fields when the source actually had values.
+            # Omitting a key on PATCH keeps the existing Dataverse value; on CREATE the field stays empty.
+            if sd.get("closing") is not None:
+                payload["ma_quantity"] = max(0, sd["closing"])
+                payload["ma_closingqty"] = max(0, sd["closing"])
+            if sd.get("opening") is not None:
+                payload["ma_openingqty"] = max(0, sd["opening"])
             nbp_info = sd.get("nbp_info", {})
             if nbp_info:
                 payload["ma_itemno"] = nbp_info["nbp_desc"]
