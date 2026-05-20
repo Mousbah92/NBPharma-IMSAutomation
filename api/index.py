@@ -289,10 +289,11 @@ def parse_expiry_string(val):
 
 COLUMN_RULES = {
     "material_code": ["material", "item number", "item no", "item code", "sku", "product code", "matl"],
-    "product_name": ["material name", "product description", "item description", "item name", "description", "product name"],
-    "customer_name": ["ship to name", "customer name", "customer", "sold to name", "sold-to party", "ship-to party"],
-    "customer_code": ["ship to", "customer id", "customer code", "sold to", "sold-to party"],
-    "customer_group": ["customer group", "cust group", "channel", "customer group 1"],
+    "product_name": ["material desc", "material description", "matl desc", "material name",
+                     "product description", "item description", "item name", "product name", "description"],
+    "customer_name": ["sold to name", "ship to name", "sold to party", "ship to party", "customer name"],
+    "customer_code": ["sold to", "ship to", "customer id", "customer code"],
+    "customer_group": ["customer group 1 desc", "customer group 1", "customer group", "cust group", "channel"],
     "region": ["region", "city", "area", "territory", "sales district"],
     "salesman": ["salesman", "sales rep", "rep", "sales office"],
     "batch": ["batch", "lot", "lot number", "batch number", "batch no", "batch no."],
@@ -351,11 +352,24 @@ def detect_header_row(ws, max_scan=25):
     return best_row, best_headers
 
 
+def _normalize_header(h):
+    """Normalize a column header for robust matching: lowercase, strip trailing dots,
+    convert various dash/hyphen/underscore variants to spaces, collapse multi-spaces.
+    This makes 'Sold -to Name' match 'sold to name' and 'Material Desc.' match 'material desc'."""
+    if h is None:
+        return ""
+    s = str(h).strip().lower().rstrip(".").strip()
+    for ch in "-\u2013\u2014_/":  # hyphen, en-dash, em-dash, underscore, slash
+        s = s.replace(ch, " ")
+    return " ".join(s.split())
+
+
 def auto_map_columns(headers):
     """Auto-detect column positions from headers. Returns {field_key: col_index}.
-    Uses two-pass matching: exact match first, then substring match."""
+    Uses two-pass matching: exact match first, then substring match.
+    Headers are normalized (lowercased, hyphens→spaces, trailing dots stripped) for robustness."""
     mapping = {}
-    headers_lower = [(h or "").strip().lower() for h in headers]
+    headers_lower = [_normalize_header(h) for h in headers]
 
     # Pass 1: exact matches only
     for field_key, keywords in COLUMN_RULES.items():
