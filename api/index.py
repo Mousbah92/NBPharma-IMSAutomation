@@ -657,7 +657,27 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
     found_batches = {}
     missing_batches = []
     for batch_nb in sorted(all_batch_numbers):
-        url = f"{API_URL}/{batch_set}?$filter=ma_batchnb eq '{batch_nb}'&$top=100"
+        # Determine the month/year/distributor scope for THIS upload — the same batch number
+        # may exist in other months or for other distributors; we only want to PATCH the
+        # record that matches the current upload's month + year + distributor.
+        if batch_nb in stock_batches:
+            sd = stock_batches[batch_nb]
+            cur_month, cur_year = sd.get("month"), sd.get("year")
+        elif batch_nb in mtd_batches:
+            md = mtd_batches[batch_nb]
+            cur_month, cur_year = md.get("month"), md.get("year")
+        else:
+            cur_month, cur_year = None, None
+
+        # Composite filter: batch + month + year + distributor.
+        # If month/year are missing for some reason, fall back to batch+distributor only.
+        filters = [f"ma_batchnb eq '{batch_nb}'", f"_ma_distributor_value eq {dist_guid}"]
+        if cur_month and cur_year:
+            filters.append(f"ma_month eq {cur_month}")
+            filters.append(f"ma_year eq {cur_year}")
+        filter_str = " and ".join(filters)
+        url = f"{API_URL}/{batch_set}?$filter={filter_str}&$top=100"
+
         resp = http_requests.get(url, headers=get_headers(), timeout=15)
         if resp.status_code == 200:
             records = resp.json().get("value", [])
