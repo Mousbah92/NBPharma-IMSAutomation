@@ -518,7 +518,27 @@ def parse_closing_stock(file_bytes):
                 rec["opening"] = opening
             if closing is not None:
                 rec["closing"] = closing
-            batches[batch_nb] = rec
+            # Defensive merge for source-file duplicates (same batch_nb across multiple rows).
+            # Quantity strategy: SUM opening and closing across all duplicate rows so the final
+            # record reflects total stock for that batch (e.g. batch 426823 with 292/69 + 0/0
+            # → 292/69; legitimately split duplicates like 100/50 + 200/30 → 300/80).
+            # Material strategy: prefer the row whose material code maps to a known product
+            # (e.g. U190005 wins over PFSU190005 variant) so the batch links to the right product.
+            existing = batches.get(batch_nb)
+            if existing:
+                # Sum quantities across rows (treat None on either side as 0 for the sum)
+                if opening is not None:
+                    existing["opening"] = (existing.get("opening") or 0) + opening
+                if closing is not None:
+                    existing["closing"] = (existing.get("closing") or 0) + closing
+                # Upgrade material/description/nbp_info if the new row has a product mapping
+                # and the existing entry doesn't (handles PFSU190005 vs U190005 case)
+                if not existing.get("nbp_info") and rec.get("nbp_info"):
+                    existing["material"] = rec["material"]
+                    existing["description"] = rec["description"]
+                    existing["nbp_info"] = rec["nbp_info"]
+            else:
+                batches[batch_nb] = rec
         # Aggregation tolerates absent values (treats them as 0 for summing purposes only)
         product_agg[material]["opening"] += (opening or 0)
         product_agg[material]["closing"] += (closing or 0)
