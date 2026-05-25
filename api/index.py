@@ -511,9 +511,13 @@ def parse_closing_stock(file_bytes):
         closing = _qty_or_none("closing")
 
         if batch_nb and is_valid_batch(batch_nb):
+            # Capture the brand from the source file's brand column as a fallback
+            # for materials not present in UNICARE_PRODUCT_MAP (e.g. BRUKINSA).
+            source_brand = get_col_str(row, col, "brand").upper().strip() or None
             rec = {"material": material, "description": get_col_str(row, col, "product_name"),
                 "expiry": expiry_str, "month": month, "year": year,
-                "nbp_info": UNICARE_PRODUCT_MAP.get(material, {})}
+                "nbp_info": UNICARE_PRODUCT_MAP.get(material, {}),
+                "source_brand": source_brand}
             if opening is not None:
                 rec["opening"] = opening
             if closing is not None:
@@ -727,8 +731,17 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
                 if exp:
                     payload["ma_expirydate"] = exp
             brand = nbp_info.get("brand", "")
-            if brand in brand_guids:
+            # Fallback 1: use brand from the source file's brand column when the
+            # material isn't in UNICARE_PRODUCT_MAP (e.g. BRUKINSA / U190002).
+            if not brand:
+                brand = sd.get("source_brand") or ""
+            if brand and brand in brand_guids:
                 payload["ma_Product@odata.bind"] = f"/{prod_set}({brand_guids[brand]})"
+            elif sd.get("description"):
+                # Fallback 2: dynamic match against the master product catalog by description.
+                guid, _ = match_product_dynamically(sd["description"], all_products)
+                if guid:
+                    payload["ma_Product@odata.bind"] = f"/{prod_set}({guid})"
         elif batch_nb in mtd_batches:
             md = mtd_batches[batch_nb]
             # Detect month/year from batch data dates or default
@@ -768,7 +781,8 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
         payload["ma_batchnb"] = batch_nb
         brand = ""
         if batch_nb in stock_batches:
-            brand = stock_batches[batch_nb].get("nbp_info", {}).get("brand", "")
+            sd = stock_batches[batch_nb]
+            brand = sd.get("nbp_info", {}).get("brand", "") or sd.get("source_brand") or ""
         elif batch_nb in mtd_batches:
             brand = mtd_batches[batch_nb].get("brand", "")
         if primary_name:
