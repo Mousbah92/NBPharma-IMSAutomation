@@ -187,6 +187,22 @@ DISTRIBUTOR_CODES = {
 }
 
 
+def get_distributor_code(dist_hint):
+    """Reverse-lookup the short code (UNI/MPC/PHL/PTD/EBS) from a distributor name hint.
+    Used for building batch/metric primary names so they reflect the actual distributor
+    rather than a hardcoded value. Falls back to first 3 letters if no match."""
+    if not dist_hint:
+        return "UNK"
+    hint_upper = str(dist_hint).upper().strip()
+    for code, name in DISTRIBUTOR_CODES.items():
+        if code == hint_upper or name.upper() == hint_upper:
+            return code
+    for code, name in DISTRIBUTOR_CODES.items():
+        if name.upper() in hint_upper or hint_upper in name.upper():
+            return code
+    return hint_upper[:3]
+
+
 def parse_distributor_from_subject(subject):
     """Extract distributor from email subject.
     Supports: short codes (PTD, UNI, MPC) or full names.
@@ -309,7 +325,7 @@ COLUMN_RULES = {
     "bill_doc": ["bill.docs", "billing document", "invoice number"],
     "po_number": ["purchase order", "po number", "cust. reference", "reference"],
     "brand": ["brand", "principal", "manufacturer", "supplier"],
-    "opening": ["opening stock", "opening bal", "opening", "sum private stock"],
+    "opening": ["opening stock", "opening bal", "opening"],
     "closing": ["closing stock", "closing bal", "closing", "total batch qty on hand"],
     "from_date": ["from date", "start date", "period start"],
     "to_date": ["to date", "end date", "period end"],
@@ -514,6 +530,14 @@ def parse_closing_stock(file_bytes):
             # Capture the brand from the source file's brand column as a fallback
             # for materials not present in UNICARE_PRODUCT_MAP (e.g. BRUKINSA).
             source_brand = get_col_str(row, col, "brand").upper().strip() or None
+            if not source_brand:
+                # Further fallback: first word of the product description (consistent with
+                # MTD sales brand derivation). Handles MPC stock files which have no brand
+                # column — e.g. "NEUPRO 2MG TD PATCHES 28'" → "NEUPRO". Strip trademark symbols.
+                desc = get_col_str(row, col, "product_name")
+                first_word = desc.split()[0] if desc.split() else ""
+                cleaned = "".join(ch for ch in first_word if ch.isalnum()).upper()
+                source_brand = cleaned or None
             rec = {"material": material, "description": get_col_str(row, col, "product_name"),
                 "expiry": expiry_str, "month": month, "year": year,
                 "nbp_info": UNICARE_PRODUCT_MAP.get(material, {}),
@@ -671,7 +695,7 @@ def detect_file_type(filename):
 # ── PIPELINE A: ENRICH BATCHES ──
 
 def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
-                            batch_set, dist_set, prod_set, valid_columns, primary_name, all_products=None):
+                            batch_set, dist_set, prod_set, valid_columns, primary_name, all_products=None, dist_code="UNI"):
     results = {"patched": 0, "created": 0, "failed": 0, "errors": []}
     if all_products is None:
         all_products = []
@@ -788,7 +812,7 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
         if primary_name:
             yr = payload.get("ma_year", 2025)
             mn = payload.get("ma_month", 9)
-            payload[primary_name] = f"{brand}_{batch_nb}_UNI_{yr}-{mn:02d}"
+            payload[primary_name] = f"{brand}_{batch_nb}_{dist_code}_{yr}-{mn:02d}"
         payload = safe_payload(payload, valid_columns)
         resp = http_requests.post(f"{API_URL}/{batch_set}", headers=get_headers(), json=payload, timeout=30)
         if resp.status_code in (200, 201, 204):
@@ -802,7 +826,7 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
 # ── PIPELINE B: UPLOAD PRODUCT METRICS (with dedup) ──
 
 def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
-                            dist_guid, brand_guids, dist_set, prod_set):
+                            dist_guid, brand_guids, dist_set, prod_set, dist_code="UNI"):
     results = {"metrics_created": 0, "metrics_updated": 0, "metrics_failed": 0, "errors": []}
     metric_map = discover_metric_picklist()
     if not metric_map:
@@ -843,7 +867,7 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
             "ma_Product@odata.bind": f"/{prod_set}({brand_guids[brand]})",
             "ma_metric": METRICS[metric_key], "ma_month": month, "ma_year": year,
             "ma_value": int(round(value)),
-            pd_primary: f"{metric_key}_{brand}_UNI_{year}-{month:02d}",
+            pd_primary: f"{metric_key}_{brand}_{dist_code}_{year}-{month:02d}",
             "_product_guid": brand_guids[brand],
             "_metric_int": METRICS[metric_key],
         })
@@ -1292,6 +1316,7 @@ def process_file(file_type, file_bytes, distributor_hint=None):
 
         # Dynamic distributor lookup (from email subject or fallback)
         dist_guid, dist_name = lookup_distributor(distributor_hint)
+        dist_code = get_distributor_code(distributor_hint or dist_name)
         if not dist_guid:
             results["status"] = "error"
             results["errors"].append(f"Distributor not found: {distributor_hint}")
@@ -1333,7 +1358,7 @@ def process_file(file_type, file_bytes, distributor_hint=None):
 
         # PIPELINE A: Enrich batches
         br = pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
-            batch_set, dist_set, prod_set, valid_columns, primary_name, all_products)
+            batch_set, dist_set, prod_set, valid_columns, primary_name, all_products, dist_code)
         results["batches_patched"] = br["patched"]
         results["batches_created"] = br["created"]
         results["failed"] += br["failed"]
@@ -1342,7 +1367,7 @@ def process_file(file_type, file_bytes, distributor_hint=None):
 
         # PIPELINE B: Upload product metrics (with dedup)
         mr = pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
-            dist_guid, brand_guids, dist_set, prod_set)
+            dist_guid, brand_guids, dist_set, prod_set, dist_code)
         results["metrics_created"] = mr["metrics_created"]
         results["metrics_updated"] = mr.get("metrics_updated", 0)
         results["failed"] += mr["metrics_failed"]
