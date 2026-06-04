@@ -14,7 +14,7 @@ Accepts distributor Excel files via HTTP POST and runs the FULL pipeline:
 Auth: Refresh token (no App Registration needed).
 """
 
-import os, io, json, time, logging
+import os, io, json, time, logging, re
 from datetime import datetime
 from collections import defaultdict
 import msal
@@ -201,6 +201,43 @@ def get_distributor_code(dist_hint):
         if name.upper() in hint_upper or hint_upper in name.upper():
             return code
     return hint_upper[:3]
+
+
+MONTH_NAMES = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sept": 9, "sep": 9,
+    "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
+
+
+def parse_period_from_subject(text):
+    """Extract (month, year) from an email subject or filename.
+    Handles 'Closing Stock MPC Jan 2026', 'MTD Sales PTD Nov 2025',
+    'Modern_..._STOCK_REPORT_JAN_2026.xlsx', and numeric mm.yyyy / mm-yyyy / mm/yyyy.
+    Returns (None, None) when not found. Used as a fallback for files (e.g. MPC stock)
+    that carry no report-period column of their own."""
+    if not text:
+        return None, None
+    # Normalize separators so underscores/dashes/dots become word boundaries
+    s = re.sub(r"[_\-./]", " ", str(text).lower())
+    year = None
+    ym = re.search(r"\b(20[2-9]\d)\b", s)
+    if ym:
+        year = int(ym.group(1))
+    month = None
+    for name, num in MONTH_NAMES.items():
+        if re.search(r"\b" + name + r"\b", s):
+            month = num
+            break
+    # Numeric fallback: mm yyyy (after normalization) e.g. "01 2026"
+    if month is None:
+        mnum = re.search(r"\b(0?[1-9]|1[0-2])\s+(20[2-9]\d)\b", s)
+        if mnum:
+            month = int(mnum.group(1))
+            if year is None:
+                year = int(mnum.group(2))
+    return month, year
 
 
 def parse_distributor_from_subject(subject):
@@ -491,7 +528,7 @@ def detect_month_year(row, mapping):
 
 # ── PARSERS (DYNAMIC) ──
 
-def parse_closing_stock(file_bytes):
+def parse_closing_stock(file_bytes, fallback_month=None, fallback_year=None):
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
     ws = wb.active
     header_row, headers = detect_header_row(ws)
@@ -507,7 +544,10 @@ def parse_closing_stock(file_bytes):
         batch_nb = get_col_str(row, col, "batch")
         month, year = detect_month_year(row, col)
         if not month:
-            month, year = 9, 2025
+            # Files like MPC stock carry no period column; fall back to the period
+            # parsed from the email subject/filename, then to a hardcoded last resort.
+            month = fallback_month or 9
+            year = fallback_year or 2025
 
         expiry = get_col(row, col, "expiry")
         expiry_str = expiry.strftime("%Y-%m-%d") if isinstance(expiry, datetime) else (str(expiry)[:10] if expiry else None)
@@ -576,7 +616,7 @@ def parse_closing_stock(file_bytes):
     wb.close()
     return batches, dict(product_agg)
 
-def parse_mtd_sales(file_bytes):
+def parse_mtd_sales(file_bytes, fallback_month=None, fallback_year=None):
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
     # Try active sheet first, then look for "Table" sheet (SAP BEx reports)
     ws = wb.active
@@ -649,6 +689,9 @@ def parse_mtd_sales(file_bytes):
             if m and y:
                 batches[batch]["month"] = m
                 batches[batch]["year"] = y
+            elif fallback_month and fallback_year:
+                batches[batch]["month"] = fallback_month
+                batches[batch]["year"] = fallback_year
 
         # Classification rules:
         # - ZUFA (or explicit foc_qty > 0)  → FOC
@@ -681,6 +724,9 @@ def parse_mtd_sales(file_bytes):
             if m and y:
                 product_metrics[brand]["month"] = m
                 product_metrics[brand]["year"] = y
+            elif fallback_month and fallback_year:
+                product_metrics[brand]["month"] = fallback_month
+                product_metrics[brand]["year"] = fallback_year
     wb.close()
     return dict(batches), dict(product_metrics)
 
@@ -1294,20 +1340,21 @@ def pipeline_update_item_codes(file_type, file_bytes, dist_guid, brand_guids, di
 
 # ── MAIN PROCESSING ──
 
-def process_file(file_type, file_bytes, distributor_hint=None):
+def process_file(file_type, file_bytes, distributor_hint=None, period_hint=(None, None)):
     results = {"status": "processing", "file_type": file_type, "steps": [],
         "batches_patched": 0, "batches_created": 0,
         "metrics_created": 0, "metrics_updated": 0, "raw_created": 0,
         "itemcodes_created": 0, "itemcodes_updated": 0,
         "failed": 0, "errors": []}
     _start_time = time.time()
+    fb_month, fb_year = period_hint if period_hint else (None, None)
     try:
         stock_batches, stock_product_agg, mtd_batches, mtd_product_metrics = {}, {}, {}, {}
         if file_type == "closing_stock":
-            stock_batches, stock_product_agg = parse_closing_stock(file_bytes)
+            stock_batches, stock_product_agg = parse_closing_stock(file_bytes, fb_month, fb_year)
             results["steps"].append(f"Parsed Closing Stock: {len(stock_batches)} batches, {len(stock_product_agg)} products")
         elif file_type == "mtd_sales":
-            mtd_batches, mtd_product_metrics = parse_mtd_sales(file_bytes)
+            mtd_batches, mtd_product_metrics = parse_mtd_sales(file_bytes, fb_month, fb_year)
             results["steps"].append(f"Parsed MTD Sales: {len(mtd_batches)} batches, {len(mtd_product_metrics)} products")
 
         batch_set = resolve_odata_set(TABLE_SKU_BATCHES)
@@ -1439,7 +1486,8 @@ def process():
     # Extract distributor hint from email subject (sent by Power Automate)
     email_subject = flask_request.headers.get("X-Email-Subject", "")
     distributor_hint = parse_distributor_from_subject(email_subject)
-    log.info(f"Email subject: '{email_subject}' → distributor: '{distributor_hint}'")
+    subject_month, subject_year = parse_period_from_subject(email_subject)
+    log.info(f"Email subject: '{email_subject}' → distributor: '{distributor_hint}', period: {subject_month}/{subject_year}")
 
     def is_excel(fn):
         return fn.lower().endswith((".xlsx", ".xls", ".xlsm"))
@@ -1469,7 +1517,14 @@ def process():
     all_results = []
     for ft, fb, fn in files_to_process:
         log.info(f"Processing: {fn} as {ft}")
-        result = process_file(ft, fb, distributor_hint=distributor_hint)
+        # Period: prefer the email subject; fall back to the filename (which also carries
+        # e.g. 'JAN_2026'), so files with no internal period column still get the right month/year.
+        pm, py = subject_month, subject_year
+        if pm is None or py is None:
+            fm, fy = parse_period_from_subject(fn)
+            pm = pm if pm is not None else fm
+            py = py if py is not None else fy
+        result = process_file(ft, fb, distributor_hint=distributor_hint, period_hint=(pm, py))
         result["filename"] = fn
         all_results.append(result)
 
