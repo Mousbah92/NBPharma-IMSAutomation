@@ -644,16 +644,18 @@ def parse_mtd_sales(file_bytes, fallback_month=None, fallback_year=None):
     product_metrics = defaultdict(lambda: {"private_qty": 0, "private_val": 0, "tender_qty": 0, "tender_val": 0,
                                            "foc_qty": 0, "foc_val": 0, "total_qty": 0, "total_val": 0})
     for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
-        # Get product identifier — try brand first, then material name, then material code
-        brand = get_col_str(row, col, "brand")
+        # Get product identifier — product description first word is the most reliable
+        # product brand (PYLERA, CIMZIA, BRIVIACT...). We deliberately prefer it over the
+        # "brand" column, which on some distributor files (e.g. Pharmalink) holds the
+        # Principal/manufacturer (CONFAB LABORATORIES INC) rather than the product itself.
         product_name = get_col_str(row, col, "product_name")
         material_code = get_col_str(row, col, "material_code")
-
-        # Derive brand from product name if no brand column
-        if not brand and product_name:
-            brand = product_name.split()[0].upper() if product_name.split() else ""
+        brand = ""
+        if product_name and product_name.split():
+            brand = product_name.split()[0].upper()
+        if not brand:
+            brand = get_col_str(row, col, "brand")
         if not brand and material_code:
-            # Try UNICARE_PRODUCT_MAP
             info = UNICARE_PRODUCT_MAP.get(material_code, {})
             brand = info.get("brand", material_code)
         if not brand:
