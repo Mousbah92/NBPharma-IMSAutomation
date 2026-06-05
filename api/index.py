@@ -324,6 +324,18 @@ def parse_expiry_string(val):
     if isinstance(val, datetime):
         return val.strftime("%Y-%m-%d")
     s = str(val).strip()
+    # Try DD-MON-YYYY / DD MON YYYY (e.g. 03-MAR-2027) — used by Pharmatrade
+    mm = re.match(r"^(\d{1,2})[-\s]([A-Za-z]{3,})[-\s](\d{2,4})$", s)
+    if mm:
+        months = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                  "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+        d, mon, y = mm.groups()
+        mon_num = months.get(mon[:3].lower())
+        if mon_num:
+            yr = int(y)
+            if yr < 100:
+                yr += 2000
+            return f"{yr:04d}-{mon_num:02d}-{int(d):02d}"
     # Try dd.mm.yyyy
     if "." in s:
         try:
@@ -349,10 +361,10 @@ COLUMN_RULES = {
     "customer_group": ["customer group 1 desc", "customer group 1", "customer group", "cust group", "channel"],
     "region": ["region", "city", "area", "territory", "sales district"],
     "salesman": ["salesman", "sales rep", "rep", "sales office"],
-    "batch": ["batch", "lot", "lot number", "batch number", "batch no", "batch no."],
-    "expiry": ["expiry", "exp date", "expiry date", "batch expiry", "best before", "expire date"],
-    "qty": ["nett sales quantity", "normal qty", "salesqty", "total qty", "total batch qty on hand",
-            "quantity", "sales qty", "base unit quantity", "closing stock"],
+    "batch": ["batch", "supplier lot number", "supplier lot", "lot number", "batch number", "batch no", "batch no.", "lot"],
+    "expiry": ["expiry", "expiration date", "expiration", "exp date", "expiry date", "batch expiry", "best before", "expire date"],
+    "qty": ["nett sales quantity", "normal qty", "salesqty", "total sale (qty shipped out)", "total sale",
+            "total qty", "total batch qty on hand", "quantity", "sales qty", "base unit quantity", "closing stock"],
     "value": ["nett sales value", "net value", "salesvalue", "value", "amount", "sales value"],
     "foc_qty": ["foc qty", "foc quantity", "free goods", "focqty", "sum foc"],
     "sample_qty": ["sample qty", "sample quantity"],
@@ -362,8 +374,8 @@ COLUMN_RULES = {
     "bill_doc": ["bill.docs", "billing document", "invoice number"],
     "po_number": ["purchase order", "po number", "cust. reference", "reference"],
     "brand": ["brand", "principal", "manufacturer", "supplier"],
-    "opening": ["opening stock", "opening bal", "opening"],
-    "closing": ["closing stock", "closing bal", "closing", "total batch qty on hand"],
+    "opening": ["opening stock", "opening balance", "opening bal", "opening"],
+    "closing": ["closing stock", "closing balance", "closing bal", "closing", "total batch qty on hand", "qty"],
     "from_date": ["from date", "start date", "period start"],
     "to_date": ["to date", "end date", "period end"],
     "pack_size": ["pack size", "pack", "bun", "uom", "inventory uom"],
@@ -373,6 +385,86 @@ COLUMN_RULES = {
     "private_qty": ["sum private stock"],
     "tender_qty": ["sum tender stock"],
 }
+
+
+class _SheetShim:
+    """openpyxl-worksheet-like wrapper backed by a list of rows.
+    Lets the existing parsers (ws.iter_rows / ws.cell / ws.max_row) work for .xls too."""
+    def __init__(self, name, rows):
+        self.title = name
+        self._rows = rows
+        self.max_row = len(rows)
+        self.max_column = max((len(r) for r in rows), default=0)
+
+    def iter_rows(self, min_row=1, max_row=None, values_only=True):
+        end = max_row if max_row else len(self._rows)
+        for r in self._rows[min_row - 1:end]:
+            yield tuple(r) + (None,) * (self.max_column - len(r))
+
+    def cell(self, row, column):
+        class _C:
+            pass
+        c = _C()
+        try:
+            c.value = self._rows[row - 1][column - 1]
+        except IndexError:
+            c.value = None
+        return c
+
+
+class _WorkbookShim:
+    def __init__(self, sheets):
+        self._sheets = sheets
+        self.sheetnames = list(sheets.keys())
+
+    @property
+    def active(self):
+        first = self.sheetnames[0]
+        return _SheetShim(first, self._sheets[first])
+
+    def __getitem__(self, name):
+        return _SheetShim(name, self._sheets[name])
+
+    def close(self):
+        pass
+
+
+def load_workbook_any(file_bytes):
+    """Load an .xls (OLE2/BIFF via xlrd) or .xlsx/.xlsm (via openpyxl) file into a
+    uniform workbook shim. Dates are returned as datetime objects in both cases so
+    downstream parsing is format-agnostic."""
+    head = file_bytes[:4]
+    if head == b"\xd0\xcf\x11\xe0":  # OLE2 compound document = legacy .xls
+        import xlrd
+        wb = xlrd.open_workbook(file_contents=file_bytes)
+        sheets = {}
+        for sname in wb.sheet_names():
+            ws = wb.sheet_by_name(sname)
+            rows = []
+            for r in range(ws.nrows):
+                row = []
+                for c in range(ws.ncols):
+                    cell = ws.cell(r, c)
+                    val = cell.value
+                    if cell.ctype == xlrd.XL_CELL_DATE:
+                        try:
+                            val = xlrd.xldate_as_datetime(val, wb.datemode)
+                        except Exception:
+                            pass
+                    elif cell.ctype == xlrd.XL_CELL_EMPTY:
+                        val = None
+                    row.append(val)
+                rows.append(row)
+            sheets[sname] = rows
+        return _WorkbookShim(sheets)
+    # Default: modern .xlsx / .xlsm
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+    sheets = {}
+    for sname in wb.sheetnames:
+        ws = wb[sname]
+        sheets[sname] = [list(r) for r in ws.iter_rows(values_only=True)]
+    wb.close()
+    return _WorkbookShim(sheets)
 
 
 def detect_header_row(ws, max_scan=25):
@@ -401,6 +493,21 @@ def detect_header_row(ws, max_scan=25):
             best_score = score
             best_row = i
             best_headers = cells
+
+    # Merge split headers: some reports put a unit label (e.g. "Qty") on its own row
+    # directly above the main header. Fold any such values into empty header slots so
+    # the column still maps. Only fills EMPTY cells, so it never overwrites real headers.
+    if best_row > 1:
+        above = [str(ws.cell(best_row - 1, c).value or "").strip() for c in range(1, ws.max_column + 1)]
+        merged = list(best_headers)
+        for idx, val in enumerate(above):
+            if val and val != "None":
+                if idx < len(merged):
+                    if not merged[idx] or merged[idx] == "None":
+                        merged[idx] = val
+                else:
+                    merged.append(val)
+        best_headers = merged
 
     return best_row, best_headers
 
@@ -529,7 +636,7 @@ def detect_month_year(row, mapping):
 # ── PARSERS (DYNAMIC) ──
 
 def parse_closing_stock(file_bytes, fallback_month=None, fallback_year=None):
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+    wb = load_workbook_any(file_bytes)
     ws = wb.active
     header_row, headers = detect_header_row(ws)
     col = auto_map_columns(headers)
@@ -537,11 +644,23 @@ def parse_closing_stock(file_bytes, fallback_month=None, fallback_year=None):
 
     batches = {}
     product_agg = defaultdict(lambda: {"opening": 0, "closing": 0, "description": "", "month": 9, "year": 2025})
+    _last_material = ""   # forward-fill carriers for grouped reports (e.g. Pharmatrade stock details,
+    _last_desc = ""       # where Item Code/Description appear only on the first row of each batch group)
     for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
         material = get_col_str(row, col, "material_code")
+        desc_here = get_col_str(row, col, "product_name")
+        batch_nb = get_col_str(row, col, "batch")
+        # Forward-fill: if this row has a batch but no material/description, inherit from
+        # the previous row that did (grouped layout). If it has neither material nor batch, skip.
+        if material:
+            _last_material = material
+            if desc_here:
+                _last_desc = desc_here
+        elif batch_nb and _last_material:
+            material = _last_material
         if not material:
             continue
-        batch_nb = get_col_str(row, col, "batch")
+        eff_desc = desc_here or _last_desc  # forward-filled description for grouped rows
         month, year = detect_month_year(row, col)
         if not month:
             # Files like MPC stock carry no period column; fall back to the period
@@ -550,7 +669,12 @@ def parse_closing_stock(file_bytes, fallback_month=None, fallback_year=None):
             year = fallback_year or 2025
 
         expiry = get_col(row, col, "expiry")
-        expiry_str = expiry.strftime("%Y-%m-%d") if isinstance(expiry, datetime) else (str(expiry)[:10] if expiry else None)
+        if isinstance(expiry, datetime):
+            expiry_str = expiry.strftime("%Y-%m-%d")
+        elif expiry:
+            expiry_str = str(expiry).strip()  # keep full string (e.g. "03-MAR-2027"); parsed later
+        else:
+            expiry_str = None
 
         # Only capture qty values when they're actually present in the source cell.
         # None signals "not in source" so the payload builder skips the field entirely.
@@ -574,11 +698,10 @@ def parse_closing_stock(file_bytes, fallback_month=None, fallback_year=None):
                 # Further fallback: first word of the product description (consistent with
                 # MTD sales brand derivation). Handles MPC stock files which have no brand
                 # column — e.g. "NEUPRO 2MG TD PATCHES 28'" → "NEUPRO". Strip trademark symbols.
-                desc = get_col_str(row, col, "product_name")
-                first_word = desc.split()[0] if desc.split() else ""
+                first_word = eff_desc.split()[0] if eff_desc.split() else ""
                 cleaned = "".join(ch for ch in first_word if ch.isalnum()).upper()
                 source_brand = cleaned or None
-            rec = {"material": material, "description": get_col_str(row, col, "product_name"),
+            rec = {"material": material, "description": eff_desc,
                 "expiry": expiry_str, "month": month, "year": year,
                 "nbp_info": UNICARE_PRODUCT_MAP.get(material, {}),
                 "source_brand": source_brand}
@@ -610,14 +733,14 @@ def parse_closing_stock(file_bytes, fallback_month=None, fallback_year=None):
         # Aggregation tolerates absent values (treats them as 0 for summing purposes only)
         product_agg[material]["opening"] += (opening or 0)
         product_agg[material]["closing"] += (closing or 0)
-        product_agg[material]["description"] = get_col_str(row, col, "product_name")
+        product_agg[material]["description"] = eff_desc
         product_agg[material]["month"] = month
         product_agg[material]["year"] = year
     wb.close()
     return batches, dict(product_agg)
 
 def parse_mtd_sales(file_bytes, fallback_month=None, fallback_year=None):
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+    wb = load_workbook_any(file_bytes)
     # Try active sheet first, then look for "Table" sheet (SAP BEx reports)
     ws = wb.active
     header_row, headers = detect_header_row(ws)
@@ -668,6 +791,12 @@ def parse_mtd_sales(file_bytes, fallback_month=None, fallback_year=None):
         qty = get_col_float(row, col, "qty", 0)
         val = get_col_float(row, col, "value", 0)
         foc = get_col_float(row, col, "foc_qty", 0)
+
+        # Summary-style files (no per-transaction bill_type column, e.g. Pharmatrade
+        # "Stock and Sales") report sales as "QTY SHIPPED OUT" using a negative sign.
+        # Flip to positive magnitude so sales metrics reflect units sold.
+        if "bill_type" not in col and qty < 0:
+            qty = abs(qty)
 
         # Batch-level aggregation (skip SAP BEx metadata labels)
         if batch and is_valid_batch(batch):
@@ -732,12 +861,27 @@ def parse_mtd_sales(file_bytes, fallback_month=None, fallback_year=None):
     wb.close()
     return dict(batches), dict(product_metrics)
 
+def detect_file_type_from_subject(subject):
+    """Determine pipeline from the email subject. Authoritative over filename, because
+    a 'Stock and Sales' file should go to the SALES pipeline even though its name
+    contains 'stock'. 'MTD Sales ...' → mtd_sales; 'Closing Stock ...' → closing_stock."""
+    if not subject:
+        return None
+    s = subject.lower()
+    if "sales" in s or "mtd" in s:
+        return "mtd_sales"
+    if "closing" in s or "stock" in s:
+        return "closing_stock"
+    return None
+
+
 def detect_file_type(filename):
     fn = filename.lower()
+    # Check sales BEFORE stock: a "stock and sales" file is a sales file.
+    if "sales" in fn or "mtd" in fn:
+        return "mtd_sales"
     if "closing" in fn or "stock" in fn:
         return "closing_stock"
-    elif "mtd" in fn or "sales" in fn:
-        return "mtd_sales"
     return "unknown"
 
 # ── PIPELINE A: ENRICH BATCHES ──
@@ -1023,7 +1167,7 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
         results["errors"].append("Could not discover raw transactions columns")
         return results
 
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+    wb = load_workbook_any(file_bytes)
     ws = wb.active
     # Try "Table" sheet for SAP BEx reports
     if "Table" in wb.sheetnames:
@@ -1249,7 +1393,7 @@ def pipeline_update_item_codes(file_type, file_bytes, dist_guid, brand_guids, di
         return results
 
     # Parse file to extract unique item code → description pairs
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True)
+    wb = load_workbook_any(file_bytes)
     ws = wb.active
     if "Table" in wb.sheetnames:
         ws = wb["Table"]
@@ -1494,6 +1638,8 @@ def process():
     def is_excel(fn):
         return fn.lower().endswith((".xlsx", ".xls", ".xlsm"))
 
+    subject_ft = detect_file_type_from_subject(email_subject)
+
     files_to_process = []
     if flask_request.files:
         for key in flask_request.files:
@@ -1501,14 +1647,15 @@ def process():
             fn = f.filename or key
             if not is_excel(fn):
                 continue
-            ft = detect_file_type(fn)
+            # Subject wins (a "Stock and Sales" file sent for sales must route to mtd_sales)
+            ft = subject_ft or detect_file_type(fn)
             if ft != "unknown":
                 files_to_process.append((ft, f.read(), fn))
     elif flask_request.data:
         fn = flask_request.headers.get("X-Filename", "file.xlsx")
         if not is_excel(fn):
             return jsonify({"status": "skipped", "reason": f"Not Excel: {fn}"}), 200
-        ft = detect_file_type(fn)
+        ft = subject_ft or detect_file_type(fn)
         if ft == "unknown":
             ft = "closing_stock"
         files_to_process.append((ft, flask_request.data, fn))
