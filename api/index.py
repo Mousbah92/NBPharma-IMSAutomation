@@ -145,6 +145,8 @@ def match_product_dynamically(product_desc, all_products):
     best_name = None
     best_score = 0
 
+    desc_strength = set(re.findall(r"\d+(?:MG/ML|MCG|MG|ML|IU|G|%)", desc_upper.replace(" ", "")))
+
     for p in all_products:
         for field in ["ma_sku", "ma_productid", "ma_productname", "ma_name"]:
             pname = p.get(field)
@@ -161,12 +163,23 @@ def match_product_dynamically(product_desc, all_products):
             if not overlap:
                 continue
 
+            # Dosage-strength guard: if BOTH the file description and the candidate product
+            # carry a strength (e.g. 200MG vs 50MG), they must share one. This prevents a
+            # 50MG SKU from matching the 200MG product when its own SKU is missing from the
+            # master — better to return no match (skip the metric) than mis-assign it.
+            pname_strength = set(re.findall(r"\d+(?:MG/ML|MCG|MG|ML|IU|G|%)", pname_upper.replace(" ", "")))
+            if desc_strength and pname_strength and not (desc_strength & pname_strength):
+                continue
+
             # Score: overlap ratio + bonus for first word (brand name) match
             score = len(overlap) / max(len(desc_words | pname_words), 1)
             # Big bonus if the first significant word matches (brand name)
             first_word = desc_upper.split()[0] if desc_upper.split() else ""
             if first_word in pname_upper:
                 score += 0.5
+            # Extra bonus when strengths match exactly — locks onto the right SKU
+            if desc_strength and (desc_strength & pname_strength):
+                score += 0.3
 
             if score > best_score:
                 best_score = score
@@ -784,6 +797,17 @@ def parse_mtd_sales(file_bytes, fallback_month=None, fallback_year=None):
         if not brand:
             continue
 
+        # SKU-specific grouping key: a single brand (e.g. VIMPAT) can have several SKUs
+        # (100MG TABS, 200MG TABS, SYRUP, INJ...). Grouping by brand alone collapses them
+        # into one product, so we key metrics by material code (unique per SKU), falling
+        # back to the full product description when no material code is present.
+        sku_key = material_code or product_name or brand
+        pm = product_metrics[sku_key]
+        pm["brand"] = brand
+        pm["material"] = material_code
+        if product_name:
+            pm["description"] = product_name
+
         batch = get_col_str(row, col, "batch")
         custgroup = get_col_str(row, col, "customer_group").lower()
         billt = get_col_str(row, col, "bill_type")
@@ -835,29 +859,29 @@ def parse_mtd_sales(file_bytes, fallback_month=None, fallback_year=None):
         is_tender = billt in ("ZTEN", "ZTND")  # placeholder for future tender bill types
 
         if is_foc:
-            product_metrics[brand]["foc_qty"] += abs(foc) if foc > 0 else abs(qty)
-            product_metrics[brand]["foc_val"] += abs(val)
+            pm["foc_qty"] += abs(foc) if foc > 0 else abs(qty)
+            pm["foc_val"] += abs(val)
             continue
 
         if is_tender:
-            product_metrics[brand]["tender_qty"] += qty
-            product_metrics[brand]["tender_val"] += val
+            pm["tender_qty"] += qty
+            pm["tender_val"] += val
         else:
             # ZUCR (normal), ZRE5 (return - keeps negative qty), and all other → PRIVATE
-            product_metrics[brand]["private_qty"] += qty
-            product_metrics[brand]["private_val"] += val
+            pm["private_qty"] += qty
+            pm["private_val"] += val
 
-        product_metrics[brand]["total_qty"] += qty
-        product_metrics[brand]["total_val"] += val
+        pm["total_qty"] += qty
+        pm["total_val"] += val
         # Store month/year from first transaction
-        if "month" not in product_metrics[brand] or not product_metrics[brand].get("month"):
+        if "month" not in pm or not pm.get("month"):
             m, y = detect_month_year(row, col)
             if m and y:
-                product_metrics[brand]["month"] = m
-                product_metrics[brand]["year"] = y
+                pm["month"] = m
+                pm["year"] = y
             elif fallback_month and fallback_year:
-                product_metrics[brand]["month"] = fallback_month
-                product_metrics[brand]["year"] = fallback_year
+                pm["month"] = fallback_month
+                pm["year"] = fallback_year
     wb.close()
     return dict(batches), dict(product_metrics)
 
@@ -1018,8 +1042,10 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
 # ── PIPELINE B: UPLOAD PRODUCT METRICS (with dedup) ──
 
 def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
-                            dist_guid, brand_guids, dist_set, prod_set, dist_code="UNI"):
+                            dist_guid, brand_guids, dist_set, prod_set, dist_code="UNI", all_products=None):
     results = {"metrics_created": 0, "metrics_updated": 0, "metrics_failed": 0, "errors": []}
+    if all_products is None:
+        all_products = []
     metric_map = discover_metric_picklist()
     if not metric_map:
         results["errors"].append("Could not discover metric picklist")
@@ -1051,44 +1077,65 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
     log.info(f"Mapped {len(METRICS)} metric keys: {list(METRICS.keys())}")
     records = []
 
-    def add_metric(brand, metric_key, value, month, year):
-        if metric_key not in METRICS or brand not in brand_guids or value == 0:
+    def resolve_guid(description, brand):
+        """Resolve the specific product GUID for a SKU. Match the full description first
+        (so 'VIMPAT 200MG TABS OF 56' → 'Vimpat 200mg tabs 56's', not the 150mg SKU),
+        then fall back to brand-level lookup."""
+        guid = None
+        if description:
+            guid, _ = match_product_dynamically(description, all_products)
+        if not guid and brand and brand in brand_guids:
+            guid = brand_guids[brand]
+        return guid
+
+    def add_metric(product_guid, label, metric_key, value, month, year):
+        if metric_key not in METRICS or not product_guid or value == 0:
             return
+        safe_label = "".join(ch for ch in str(label) if ch.isalnum() or ch in "-._")[:40]
         records.append({
             "ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})",
-            "ma_Product@odata.bind": f"/{prod_set}({brand_guids[brand]})",
+            "ma_Product@odata.bind": f"/{prod_set}({product_guid})",
             "ma_metric": METRICS[metric_key], "ma_month": month, "ma_year": year,
             "ma_value": int(round(value)),
-            pd_primary: f"{metric_key}_{brand}_{dist_code}_{year}-{month:02d}",
-            "_product_guid": brand_guids[brand],
+            pd_primary: f"{metric_key}_{safe_label}_{dist_code}_{year}-{month:02d}",
+            "_product_guid": product_guid,
             "_metric_int": METRICS[metric_key],
         })
 
     if file_type == "closing_stock" and stock_product_agg:
         for material, vals in stock_product_agg.items():
-            brand = MATERIAL_TO_BRAND.get(material)
-            if not brand:
+            desc = vals.get("description", "")
+            brand = MATERIAL_TO_BRAND.get(material) or (desc.split()[0].upper() if desc.split() else "")
+            guid = resolve_guid(desc, brand)
+            if not guid:
                 continue
+            label = material or brand
             month = vals.get("month", 9)
             year = vals.get("year", 2025)
-            add_metric(brand, "stock_open", vals["opening"], month, year)
-            add_metric(brand, "stock_close", vals["closing"], month, year)
+            add_metric(guid, label, "stock_open", vals["opening"], month, year)
+            add_metric(guid, label, "stock_close", vals["closing"], month, year)
 
     if file_type == "mtd_sales" and mtd_product_metrics:
-        # Detect month/year from the data (use first batch's date or fallback)
+        # Per-SKU detected month/year, with a shared fallback from the first SKU that has one
         detected_month, detected_year = 9, 2025
-        # Check if parse returned month/year info
-        for brand, v in mtd_product_metrics.items():
+        for sku_key, v in mtd_product_metrics.items():
             if v.get("month") and v.get("year"):
-                detected_month = v["month"]
-                detected_year = v["year"]
+                detected_month, detected_year = v["month"], v["year"]
                 break
-        for brand, v in mtd_product_metrics.items():
-            add_metric(brand, "private_sales", v["private_qty"], detected_month, detected_year)
-            add_metric(brand, "tender_sales", v["tender_qty"], detected_month, detected_year)
-            add_metric(brand, "ims_total_qty", v["total_qty"], detected_month, detected_year)
-            add_metric(brand, "foc_samples", v["foc_qty"], detected_month, detected_year)
-            add_metric(brand, "total_non_sales", v["foc_qty"], detected_month, detected_year)
+        for sku_key, v in mtd_product_metrics.items():
+            desc = v.get("description", "")
+            brand = v.get("brand", "")
+            guid = resolve_guid(desc, brand)
+            if not guid:
+                continue
+            month = v.get("month", detected_month)
+            year = v.get("year", detected_year)
+            label = v.get("material") or sku_key
+            add_metric(guid, label, "private_sales", v["private_qty"], month, year)
+            add_metric(guid, label, "tender_sales", v["tender_qty"], month, year)
+            add_metric(guid, label, "ims_total_qty", v["total_qty"], month, year)
+            add_metric(guid, label, "foc_samples", v["foc_qty"], month, year)
+            add_metric(guid, label, "total_non_sales", v["foc_qty"], month, year)
 
     log.info(f"Prepared {len(records)} metric records for ma_imsproductdata")
 
@@ -1560,7 +1607,7 @@ def process_file(file_type, file_bytes, distributor_hint=None, period_hint=(None
 
         # PIPELINE B: Upload product metrics (with dedup)
         mr = pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
-            dist_guid, brand_guids, dist_set, prod_set, dist_code)
+            dist_guid, brand_guids, dist_set, prod_set, dist_code, all_products)
         results["metrics_created"] = mr["metrics_created"]
         results["metrics_updated"] = mr.get("metrics_updated", 0)
         results["failed"] += mr["metrics_failed"]
