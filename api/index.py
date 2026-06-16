@@ -14,7 +14,7 @@ Accepts distributor Excel files via HTTP POST and runs the FULL pipeline:
 Auth: Refresh token (no App Registration needed).
 """
 
-import os, io, json, time, logging, re
+import os, io, json, time, logging, re, math
 from datetime import datetime
 from collections import defaultdict
 import msal
@@ -130,65 +130,79 @@ def find_product_guid(brand_name, all_products):
     return None
 
 
+def _tokenize_product(text):
+    return {w for w in text.upper().replace(",", " ").replace("-", " ").replace("'", "").replace(".", " ").split()
+            if len(w) >= 3 and w not in {"THE", "FOR", "AND"}}
+
+
 def match_product_dynamically(product_desc, all_products):
-    """Match a product description from file against ma_imsproducts.
-    Uses keyword overlap scoring — works across different distributor naming conventions."""
+    """Match a product description from a file against ma_imsproducts.
+    Uses IDF-weighted keyword overlap: words that are rare across the product catalogue
+    (e.g. flavours like APPLE/GRAPE, strengths like 200MG) count far more than boilerplate
+    shared by many products (DRINK, PROTEIN, CONTENT, GLUTEN). This is what lets near-identical
+    SKUs that differ only by flavour or strength match their OWN product instead of collapsing
+    onto a single one."""
     if not product_desc:
         return None, None
 
     desc_upper = product_desc.upper()
-    desc_words = set(desc_upper.replace(",", " ").replace("-", " ").replace("'", "").split())
-    # Remove very short/common words
-    desc_words = {w for w in desc_words if len(w) >= 3 and w not in {"THE", "FOR", "AND", "MG/ML"}}
-
-    best_guid = None
-    best_name = None
-    best_score = 0
-
+    desc_words = _tokenize_product(desc_upper)
+    if not desc_words:
+        return None, None
     desc_strength = set(re.findall(r"\d+(?:MG/ML|MCG|MG|ML|IU|G|%)", desc_upper.replace(" ", "")))
 
+    # Build candidate list + document frequency for IDF weighting
+    candidates = []  # (product, name, name_words, name_strength)
+    df = {}
     for p in all_products:
         for field in ["ma_sku", "ma_productid", "ma_productname", "ma_name"]:
             pname = p.get(field)
-            if not pname or not isinstance(pname, str):
-                continue
-            pname_upper = pname.upper()
-            pname_words = set(pname_upper.replace(",", " ").replace("-", " ").replace("'", "").split())
-            pname_words = {w for w in pname_words if len(w) >= 3}
+            if pname and isinstance(pname, str):
+                nwords = _tokenize_product(pname)
+                if nwords:
+                    nstrength = set(re.findall(r"\d+(?:MG/ML|MCG|MG|ML|IU|G|%)", pname.upper().replace(" ", "")))
+                    candidates.append((p, pname, nwords, nstrength))
+                    for w in nwords:
+                        df[w] = df.get(w, 0) + 1
+                break
+    n_docs = max(len(candidates), 1)
 
-            if not pname_words:
-                continue
+    def idf(word):
+        # Rare words → high weight; words in every product → ~0 weight
+        return math.log((n_docs + 1) / (df.get(word, 0) + 1)) + 1.0
 
-            overlap = desc_words & pname_words
-            if not overlap:
-                continue
+    best_guid = None
+    best_name = None
+    best_score = 0.0
 
-            # Dosage-strength guard: if BOTH the file description and the candidate product
-            # carry a strength (e.g. 200MG vs 50MG), they must share one. This prevents a
-            # 50MG SKU from matching the 200MG product when its own SKU is missing from the
-            # master — better to return no match (skip the metric) than mis-assign it.
-            pname_strength = set(re.findall(r"\d+(?:MG/ML|MCG|MG|ML|IU|G|%)", pname_upper.replace(" ", "")))
-            if desc_strength and pname_strength and not (desc_strength & pname_strength):
-                continue
+    for p, pname, pname_words, pname_strength in candidates:
+        overlap = desc_words & pname_words
+        if not overlap:
+            continue
+        # Dosage-strength guard: if BOTH carry a strength they must share one (200MG vs 50MG).
+        if desc_strength and pname_strength and not (desc_strength & pname_strength):
+            continue
+        # IDF-weighted Jaccard: distinctive shared words dominate the score
+        overlap_w = sum(idf(w) for w in overlap)
+        union_w = sum(idf(w) for w in (desc_words | pname_words))
+        score = overlap_w / max(union_w, 1e-9)
+        first_word = desc_upper.split()[0] if desc_upper.split() else ""
+        if first_word and first_word in pname_upper_safe(pname):
+            score += 0.10
+        if desc_strength and (desc_strength & pname_strength):
+            score += 0.10
+        if score > best_score:
+            best_score = score
+            best_guid = p["ma_imsproductsid"]
+            best_name = pname
 
-            # Score: overlap ratio + bonus for first word (brand name) match
-            score = len(overlap) / max(len(desc_words | pname_words), 1)
-            # Big bonus if the first significant word matches (brand name)
-            first_word = desc_upper.split()[0] if desc_upper.split() else ""
-            if first_word in pname_upper:
-                score += 0.5
-            # Extra bonus when strengths match exactly — locks onto the right SKU
-            if desc_strength and (desc_strength & pname_strength):
-                score += 0.3
-
-            if score > best_score:
-                best_score = score
-                best_guid = p["ma_imsproductsid"]
-                best_name = pname
-
-    if best_score >= 0.3:  # threshold
+    if best_score >= 0.30:
         return best_guid, best_name
     return None, None
+
+
+def pname_upper_safe(name):
+    return name.upper() if isinstance(name, str) else ""
 
 
 DISTRIBUTOR_CODES = {
@@ -1745,5 +1759,83 @@ def process():
         "raw_transactions": tr, "item_codes": ti, "failed": tf},
         "files": all_results, "errors": errs[:10]}
     return jsonify(response), 200 if st in ("success", "partial") else 500
+
+
+@app.route("/api/cleanup_sales_metrics", methods=["POST"])
+def cleanup_sales_metrics():
+    """One-shot cleanup: delete SALES metrics (private_sales, tender_sales, ims_total_qty,
+    foc_samples, total_non_sales) for a given distributor + month + year. Use this to remove
+    stale brand-collapsed metrics before re-importing a sales file with the SKU-level logic.
+    Does NOT touch stock metrics (stock_open/stock_close) or batches.
+
+    Call with the same header style as imports:
+      X-API-Key + X-Email-Subject: 'MTD Sales MPC Jan 2026'
+    or override via query params ?month=1&year=2026 (distributor still from subject)."""
+    api_key = flask_request.headers.get("X-API-Key", "")
+    if api_key != API_SECRET_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+
+    subject = flask_request.headers.get("X-Email-Subject", "")
+    dist_hint = parse_distributor_from_subject(subject)
+    s_month, s_year = parse_period_from_subject(subject)
+    try:
+        month = int(flask_request.args.get("month", s_month or 0)) or s_month
+        year = int(flask_request.args.get("year", s_year or 0)) or s_year
+    except (ValueError, TypeError):
+        month, year = s_month, s_year
+
+    if not dist_hint or not month or not year:
+        return jsonify({"error": "Need distributor + month + year. Send X-Email-Subject like "
+                                 "'MTD Sales MPC Jan 2026' (or add ?month=1&year=2026)."}), 400
+
+    dist_guid, dist_name = lookup_distributor(dist_hint)
+    if not dist_guid:
+        return jsonify({"error": f"Distributor not found: {dist_hint}"}), 404
+
+    metric_map = discover_metric_picklist()
+    if not metric_map:
+        return jsonify({"error": "Could not read metric picklist"}), 500
+
+    # Identify the integer values for the five SALES metrics only
+    sales_ints = set()
+    for label_upper, val in metric_map.items():
+        if not isinstance(label_upper, str):
+            continue
+        if ("PRIVATE MARKET SALES" in label_upper
+                or "SUPPLY TO LOCAL TENDERS" in label_upper
+                or ("IMS ACT" in label_upper and "QTTY" in label_upper)
+                or ("FOC" in label_upper and "SAMPLE" in label_upper)
+                or "TOTAL NON SALES" in label_upper):
+            sales_ints.add(val)
+
+    pd_set = resolve_odata_set(TABLE_PRODUCT_DATA)
+    deleted, failed, scanned = 0, 0, 0
+    for metric_int in sales_ints:
+        filter_str = (f"ma_metric eq {metric_int} and ma_month eq {month}"
+                      f" and ma_year eq {year} and _ma_distributor_value eq {dist_guid}")
+        url = f"{API_URL}/{pd_set}?$filter={filter_str}&$top=500"
+        resp = http_requests.get(url, headers=get_headers(), timeout=30)
+        if resp.status_code != 200:
+            continue
+        for rec in resp.json().get("value", []):
+            scanned += 1
+            rec_id = rec.get("ma_imsproductdataid")
+            if not rec_id:
+                for k, v in rec.items():
+                    if k.startswith("ma_") and k.endswith("id") and v:
+                        rec_id = v
+                        break
+            if rec_id:
+                d = http_requests.delete(f"{API_URL}/{pd_set}({rec_id})", headers=get_headers(), timeout=30)
+                if d.status_code in (200, 204):
+                    deleted += 1
+                else:
+                    failed += 1
+            time.sleep(0.02)
+
+    return jsonify({"status": "success", "distributor": dist_name, "month": month, "year": year,
+                    "sales_metric_types": len(sales_ints), "scanned": scanned,
+                    "metrics_deleted": deleted, "delete_failed": failed})
+
 
 handler = app
