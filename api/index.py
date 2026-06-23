@@ -131,7 +131,11 @@ def find_product_guid(brand_name, all_products):
 
 
 def _tokenize_product(text):
-    return {w for w in text.upper().replace(",", " ").replace("-", " ").replace("'", "").replace(".", " ").split()
+    t = text.upper()
+    # Collapse a number + space + unit into one token ("100 MCG" → "100MCG", "200 MG" → "200MG")
+    # so strengths tokenize the same way whether or not the source puts a space before the unit.
+    t = re.sub(r"(\d+)\s+(MG/ML|MCG|MG|ML|IU|KG|G|%)\b", r"\1\2", t)
+    return {w for w in t.replace(",", " ").replace("-", " ").replace("'", "").replace(".", " ").split()
             if len(w) >= 3 and w not in {"THE", "FOR", "AND"}}
 
 
