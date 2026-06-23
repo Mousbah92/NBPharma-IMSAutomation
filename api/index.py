@@ -155,7 +155,7 @@ def match_product_dynamically(product_desc, all_products):
     candidates = []  # (product, name, name_words, name_strength)
     df = {}
     for p in all_products:
-        for field in ["ma_sku", "ma_productid", "ma_productname", "ma_name"]:
+        for field in ["ma_sku", "ma_productname", "ma_name"]:
             pname = p.get(field)
             if pname and isinstance(pname, str):
                 nwords = _tokenize_product(pname)
@@ -182,13 +182,16 @@ def match_product_dynamically(product_desc, all_products):
         # Dosage-strength guard: if BOTH carry a strength they must share one (200MG vs 50MG).
         if desc_strength and pname_strength and not (desc_strength & pname_strength):
             continue
-        # IDF-weighted Jaccard: distinctive shared words dominate the score
+        # IDF-weighted coverage: what fraction of the PRODUCT's word-weight is present in
+        # the file description. Using the product's words as the denominator (not the union)
+        # means a verbose file description ("...low lactose content, gluten-free") still
+        # matches a concise master name as long as it contains the product's key terms.
         overlap_w = sum(idf(w) for w in overlap)
-        union_w = sum(idf(w) for w in (desc_words | pname_words))
-        score = overlap_w / max(union_w, 1e-9)
+        pname_w = sum(idf(w) for w in pname_words)
+        score = overlap_w / max(pname_w, 1e-9)
         first_word = desc_upper.split()[0] if desc_upper.split() else ""
         if first_word and first_word in pname_upper_safe(pname):
-            score += 0.10
+            score += 0.05
         if desc_strength and (desc_strength & pname_strength):
             score += 0.10
         if score > best_score:
@@ -196,13 +199,64 @@ def match_product_dynamically(product_desc, all_products):
             best_guid = p["ma_imsproductsid"]
             best_name = pname
 
-    if best_score >= 0.30:
+    if best_score >= 0.55:
         return best_guid, best_name
     return None, None
 
 
 def pname_upper_safe(name):
     return name.upper() if isinstance(name, str) else ""
+
+
+# Curated distributor item-code → product (PRD ID) overrides. Authoritative, exact mapping
+# used where fuzzy description matching is unreliable — specifically the Pharmatrade Delical
+# and Taranis nutritional ranges, where 40+ near-identical SKUs differ only by flavour/wording
+# ("low lactose" vs "Lactose-Free", "flavour" vs "Flavor", plurals) and cannot be told apart
+# by text matching. Item codes are stable, so this mapping is permanent.
+# Any code NOT listed here falls through to match_product_dynamically unchanged, so every
+# other distributor and SKU behaves exactly as before — this is purely additive.
+PRODUCT_CODE_OVERRIDES = {
+    # Delical Fruit Drink (plain)
+    "N02.118868701.A": "PRD-1113",   # Orange
+    "N02.118868801.A": "PRD-1109",   # Grape
+    "N02.118868901.A": "PRD-1106",   # Apple
+    "N02.118869001.A": "PRD-1100",   # Multi-Fruit
+    "N02.118869101.A": "PRD-1102",   # Pineapple
+    # Delical Fruit sweetened
+    "N02.118870001.A": "PRD-1096",   # Orange
+    "N02.121277401.A": "PRD-1114",   # Multifruit
+    "N02.121277501.A": "PRD-1194",   # Apple
+    # Delical sweetened Beverage
+    "N02.142955.A": "PRD-1093",      # Vanilla
+    "N02.142956.A": "PRD-1094",      # Coffee (variant A)
+    "N02.142956.B": "PRD-1094",      # Coffee (variant B) — same product
+    "N02.142957.A": "PRD-1098",      # Strawberry
+    # Taranis
+    "N02.050-01773.A": "PRD-1191",       # Flour
+    "N02.050-01779-1.A": "PRD-1161",     # Chocolate Chip Biscuits 120g 12's
+    "N02.050-1780.A": "PRD-1163",        # Dalia Milk (liquid 200ml)
+    "N02.121497601.A": "PRD-1193",       # Cookies w/Chocolate 160g
+    "N02.121497601.B": "PRD-1193",       # Cookies w/Chocolate 160g Bonus — same product
+    "N02.142750.A": "PRD-1166",          # Rice 500g
+    "N02.208671.A": "PRD-1192",          # Egg substitute 300g
+    "N02.3401276816642A.A": "PRD-1171",  # Spaghetti (file typo "SPAGHITTI")
+    "N02.3401297993292A.A": "PRD-1148",  # Cake Mix 300g
+    "N02.3401298873418.A": "PRD-1164",   # Meat substitute
+    "N02.40000001731.A": "PRD-1168",     # Macaroni GF 500g (Box of 10)
+}
+
+
+def resolve_product(item_code, description, all_products):
+    """Resolve a product GUID for a distributor SKU.
+    1. Exact item-code override (authoritative for messy nutritional ranges).
+    2. Fall back to IDF fuzzy description matching (unchanged behaviour for everything else).
+    Returns (guid, product_name) or (None, None)."""
+    prd = PRODUCT_CODE_OVERRIDES.get((item_code or "").strip())
+    if prd:
+        for p in all_products:
+            if str(p.get("ma_productid", "")).strip() == prd:
+                return p["ma_imsproductsid"], (p.get("ma_sku") or p.get("ma_productname") or prd)
+    return match_product_dynamically(description, all_products)
 
 
 DISTRIBUTOR_CODES = {
@@ -989,13 +1043,12 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
             # material isn't in UNICARE_PRODUCT_MAP (e.g. BRUKINSA / U190002).
             if not brand:
                 brand = sd.get("source_brand") or ""
-            if brand and brand in brand_guids:
-                payload["ma_Product@odata.bind"] = f"/{prod_set}({brand_guids[brand]})"
-            elif sd.get("description"):
-                # Fallback 2: dynamic match against the master product catalog by description.
-                guid, _ = match_product_dynamically(sd["description"], all_products)
-                if guid:
-                    payload["ma_Product@odata.bind"] = f"/{prod_set}({guid})"
+            # Exact item-code override first, then description fuzzy match, then brand.
+            guid, _ = resolve_product(sd.get("material"), sd.get("description", ""), all_products)
+            if not guid and brand and brand in brand_guids:
+                guid = brand_guids[brand]
+            if guid:
+                payload["ma_Product@odata.bind"] = f"/{prod_set}({guid})"
         elif batch_nb in mtd_batches:
             md = mtd_batches[batch_nb]
             # Detect month/year from batch data dates or default
@@ -1009,13 +1062,12 @@ def pipeline_enrich_batches(stock_batches, mtd_batches, dist_guid, brand_guids,
                 if exp:
                     payload["ma_expirydate"] = exp
             brand = md.get("brand", "")
-            if brand in brand_guids:
-                payload["ma_Product@odata.bind"] = f"/{prod_set}({brand_guids[brand]})"
-            elif md.get("name"):
-                # Try dynamic match by product description
-                guid, _ = match_product_dynamically(md["name"], all_products)
-                if guid:
-                    payload["ma_Product@odata.bind"] = f"/{prod_set}({guid})"
+            # Exact item-code override first, then description fuzzy match, then brand.
+            guid, _ = resolve_product(md.get("material"), md.get("name", ""), all_products)
+            if not guid and brand and brand in brand_guids:
+                guid = brand_guids[brand]
+            if guid:
+                payload["ma_Product@odata.bind"] = f"/{prod_set}({guid})"
         return payload
 
     for batch_nb, records in found_batches.items():
@@ -1091,13 +1143,11 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
     log.info(f"Mapped {len(METRICS)} metric keys: {list(METRICS.keys())}")
     records = []
 
-    def resolve_guid(description, brand):
-        """Resolve the specific product GUID for a SKU. Match the full description first
-        (so 'VIMPAT 200MG TABS OF 56' → 'Vimpat 200mg tabs 56's', not the 150mg SKU),
-        then fall back to brand-level lookup."""
-        guid = None
-        if description:
-            guid, _ = match_product_dynamically(description, all_products)
+    def resolve_guid(description, brand, item_code=None):
+        """Resolve the specific product GUID for a SKU. Exact item-code override first
+        (so messy Delical/Taranis SKUs land on the right product), then full-description
+        fuzzy match (so 'VIMPAT 200MG' → '...200mg', not the 150mg SKU), then brand-level."""
+        guid, _ = resolve_product(item_code, description, all_products)
         if not guid and brand and brand in brand_guids:
             guid = brand_guids[brand]
         return guid
@@ -1120,7 +1170,7 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
         for material, vals in stock_product_agg.items():
             desc = vals.get("description", "")
             brand = MATERIAL_TO_BRAND.get(material) or (desc.split()[0].upper() if desc.split() else "")
-            guid = resolve_guid(desc, brand)
+            guid = resolve_guid(desc, brand, material)
             if not guid:
                 continue
             label = material or brand
@@ -1139,7 +1189,7 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
         for sku_key, v in mtd_product_metrics.items():
             desc = v.get("description", "")
             brand = v.get("brand", "")
-            guid = resolve_guid(desc, brand)
+            guid = resolve_guid(desc, brand, v.get("material") or sku_key)
             if not guid:
                 continue
             month = v.get("month", detected_month)
@@ -1490,8 +1540,8 @@ def pipeline_update_item_codes(file_type, file_bytes, dist_guid, brand_guids, di
             # Filter might fail — try without filter, we'll just create
             log.warning(f"Item code filter failed for {item_code}, creating new")
 
-        # Match product dynamically
-        product_guid, matched_name = match_product_dynamically(product_desc, all_products)
+        # Resolve product: exact item-code override first, then description fuzzy match
+        product_guid, matched_name = resolve_product(item_code, product_desc, all_products)
 
         # Build payload
         payload = {
