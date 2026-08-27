@@ -1156,7 +1156,7 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
             guid = brand_guids[brand]
         return guid
 
-    def add_metric(product_guid, label, metric_key, value, month, year):
+    def add_metric(product_guid, sku, label, metric_key, value, month, year):
         if metric_key not in METRICS or not product_guid or value == 0:
             return
         safe_label = "".join(ch for ch in str(label) if ch.isalnum() or ch in "-._")[:40]
@@ -1164,7 +1164,7 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
             "ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})",
             "ma_Product@odata.bind": f"/{prod_set}({product_guid})",
             "ma_metric": METRICS[metric_key], "ma_month": month, "ma_year": year,
-            "ma_distributorsku": "Test SKU Desc",
+            "ma_distributorsku": sku,
             "ma_value": int(round(value)),
             pd_primary: f"{metric_key}_{safe_label}_{dist_code}_{year}-{month:02d}",
             "_product_guid": product_guid,
@@ -1181,8 +1181,8 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
             label = material or brand
             month = vals.get("month", 9)
             year = vals.get("year", 2025)
-            add_metric(guid, label, "stock_open", vals["opening"], month, year)
-            add_metric(guid, label, "stock_close", vals["closing"], month, year)
+            add_metric(guid, desc, label, "stock_open", vals["opening"], month, year)
+            add_metric(guid, desc, label, "stock_close", vals["closing"], month, year)
 
     if file_type == "mtd_sales" and mtd_product_metrics:
         # Per-SKU detected month/year, with a shared fallback from the first SKU that has one
@@ -1200,15 +1200,15 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
             month = v.get("month", detected_month)
             year = v.get("year", detected_year)
             label = v.get("material") or sku_key
-            add_metric(guid, label, "private_sales", v["private_qty"], month, year)
-            add_metric(guid, label, "tender_sales", v["tender_qty"], month, year)
-            add_metric(guid, label, "ims_total_qty", v["total_qty"], month, year)
-            add_metric(guid, label, "foc_samples", v["foc_qty"], month, year)
-            add_metric(guid, label, "total_non_sales", v["foc_qty"], month, year)
+            add_metric(guid, desc, label, "private_sales", v["private_qty"], month, year)
+            add_metric(guid, desc, label, "tender_sales", v["tender_qty"], month, year)
+            add_metric(guid, desc, label, "ims_total_qty", v["total_qty"], month, year)
+            add_metric(guid, desc, label, "foc_samples", v["foc_qty"], month, year)
+            add_metric(guid, desc, label, "total_non_sales", v["foc_qty"], month, year)
 
     log.info(f"Prepared {len(records)} metric records for ma_imsproductdata")
 
-    # DEDUP: check if record exists before creating
+    # DEDUP: check if record exists before creatinggg
     for rec in records:
         product_guid = rec.pop("_product_guid")
         metric_int = rec.pop("_metric_int")
