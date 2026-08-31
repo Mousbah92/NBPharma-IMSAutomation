@@ -1156,19 +1156,28 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
             guid = brand_guids[brand]
         return guid
 
-    def add_metric(product_guid, sku, label, metric_key, value, month, year):
-        if metric_key not in METRICS or not product_guid or value == 0:
+    def add_metric(sku, label, metric_key, value, month, year):
+        """Build a product-metric record using the distributor's own SKU text.
+
+        ma_Product is intentionally not populated.  Distributor SKU + distributor +
+        metric + period is the unique import identity, so similarly named products
+        never overwrite one another because of an incorrect product match.
+        """
+        if metric_key not in METRICS or value == 0:
             return
-        distributor_sku = str(sku).strip()
-        safe_label = "".join(ch for ch in distributor_sku if ch.isalnum() or ch in "-._")[:40]
+        distributor_sku = str(sku or label or "").strip()
+        if not distributor_sku:
+            return
+        safe_label = "".join(
+            ch for ch in str(label or distributor_sku)
+            if ch.isalnum() or ch in "-._"
+        )[:40]
         records.append({
             "ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})",
-            "ma_Product@odata.bind": f"/{prod_set}({product_guid})",
             "ma_metric": METRICS[metric_key], "ma_month": month, "ma_year": year,
             "ma_distributorsku": distributor_sku,
             "ma_value": int(round(value)),
             pd_primary: f"{metric_key}_{safe_label}_{dist_code}_{year}-{month:02d}",
-            "_product_guid": product_guid,
             "_metric_int": METRICS[metric_key],
         })
 
@@ -1176,14 +1185,11 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
         for material, vals in stock_product_agg.items():
             desc = vals.get("description", "")
             brand = MATERIAL_TO_BRAND.get(material) or (desc.split()[0].upper() if desc.split() else "")
-            guid = resolve_guid(desc, brand, material)
-            if not guid:
-                continue
             label = material or brand
             month = vals.get("month", 9)
             year = vals.get("year", 2025)
-            add_metric(guid, desc, label, "stock_open", vals["opening"], month, year)
-            add_metric(guid, desc, label, "stock_close", vals["closing"], month, year)
+            add_metric(desc, label, "stock_open", vals["opening"], month, year)
+            add_metric(desc, label, "stock_close", vals["closing"], month, year)
 
     if file_type == "mtd_sales" and mtd_product_metrics:
         # Per-SKU detected month/year, with a shared fallback from the first SKU that has one
@@ -1195,29 +1201,27 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
         for sku_key, v in mtd_product_metrics.items():
             desc = v.get("description", "")
             brand = v.get("brand", "")
-            guid = resolve_guid(desc, brand, v.get("material") or sku_key)
-            if not guid:
-                continue
             month = v.get("month", detected_month)
             year = v.get("year", detected_year)
             label = v.get("material") or sku_key
-            add_metric(guid, desc, label, "private_sales", v["private_qty"], month, year)
-            add_metric(guid, desc, label, "tender_sales", v["tender_qty"], month, year)
-            add_metric(guid, desc, label, "ims_total_qty", v["total_qty"], month, year)
-            add_metric(guid, desc, label, "foc_samples", v["foc_qty"], month, year)
-            add_metric(guid, desc, label, "total_non_sales", v["foc_qty"], month, year)
+            add_metric(desc, label, "private_sales", v["private_qty"], month, year)
+            add_metric(desc, label, "tender_sales", v["tender_qty"], month, year)
+            add_metric(desc, label, "ims_total_qty", v["total_qty"], month, year)
+            add_metric(desc, label, "foc_samples", v["foc_qty"], month, year)
+            add_metric(desc, label, "total_non_sales", v["foc_qty"], month, year)
 
     log.info(f"Prepared {len(records)} metric records for ma_imsproductdata")
 
     # DEDUP: check if record exists before creatinggg
     for rec in records:
-        product_guid = rec.pop("_product_guid")
         metric_int = rec.pop("_metric_int")
         month = rec["ma_month"]
         year = rec["ma_year"]
+        distributor_sku = rec["ma_distributorsku"]
+        escaped_sku = distributor_sku.replace("'", "''")
 
-        # Search for existing record with same product + metric + month + year
-        filter_str = (f"_ma_product_value eq {product_guid}"
+        # Search by the distributor's exact SKU description, not by ma_Product.
+        filter_str = (f"ma_distributorsku eq '{escaped_sku}'"
                       f" and ma_metric eq {metric_int}"
                       f" and ma_month eq {month}"
                       f" and ma_year eq {year}"
@@ -1242,7 +1246,13 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
                         rec_id = v
                         break
             if rec_id:
-                patch_payload = {"ma_value": clean.get("ma_value", 0)}
+                # Update both the metric value and the distributor SKU/description.
+                # Previously only ma_value was patched, so records created by an older
+                # import remained blank in ma_distributorsku forever.
+                patch_payload = {
+                    "ma_value": clean.get("ma_value", 0),
+                    "ma_distributorsku": clean.get("ma_distributorsku", ""),
+                }
                 resp = http_requests.patch(f"{API_URL}/{pd_set}({rec_id})",
                     headers=get_headers(), json=patch_payload, timeout=30)
                 if resp.status_code in (200, 204):
