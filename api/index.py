@@ -1160,15 +1160,12 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
         if metric_key not in METRICS or not product_guid or value == 0:
             return
         safe_label = "".join(ch for ch in str(label) if ch.isalnum() or ch in "-._")[:40]
+        sku = ""
         records.append({
             "ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})",
             "ma_Product@odata.bind": f"/{prod_set}({product_guid})",
             "ma_metric": METRICS[metric_key], "ma_month": month, "ma_year": year,
-<<<<<<< HEAD
             "ma_distributorsku": sku,
-=======
-            "ma_distributorsku": "",
->>>>>>> 14a0500 (Test Add data to field ma_distributorsku in Product Data table 3)
             "ma_value": int(round(value)),
             pd_primary: f"{metric_key}_{safe_label}_{dist_code}_{year}-{month:02d}",
             "_product_guid": product_guid,
@@ -1212,7 +1209,7 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
 
     log.info(f"Prepared {len(records)} metric records for ma_imsproductdata")
 
-    # DEDUP: check if record exists before creatinggg
+    # DEDUP: check if record exists before creating
     for rec in records:
         product_guid = rec.pop("_product_guid")
         metric_int = rec.pop("_metric_int")
