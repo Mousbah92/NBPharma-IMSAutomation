@@ -1159,12 +1159,13 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
     def add_metric(product_guid, sku, label, metric_key, value, month, year):
         if metric_key not in METRICS or not product_guid or value == 0:
             return
-        safe_label = "".join(ch for ch in str(label) if ch.isalnum() or ch in "-._")[:40]
+        distributor_sku = str(label or sku or "").strip()
+        safe_label = "".join(ch for ch in distributor_sku if ch.isalnum() or ch in "-._")[:40]
         records.append({
             "ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})",
             "ma_Product@odata.bind": f"/{prod_set}({product_guid})",
             "ma_metric": METRICS[metric_key], "ma_month": month, "ma_year": year,
-            "ma_distributorsku": "",
+            "ma_distributorsku": distributor_sku,
             "ma_value": int(round(value)),
             pd_primary: f"{metric_key}_{safe_label}_{dist_code}_{year}-{month:02d}",
             "_product_guid": product_guid,
