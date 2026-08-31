@@ -1164,7 +1164,11 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
             "ma_Distributor@odata.bind": f"/{dist_set}({dist_guid})",
             "ma_Product@odata.bind": f"/{prod_set}({product_guid})",
             "ma_metric": METRICS[metric_key], "ma_month": month, "ma_year": year,
+<<<<<<< HEAD
             "ma_distributorsku": sku,
+=======
+            "ma_distributorsku": "",
+>>>>>>> 14a0500 (Test Add data to field ma_distributorsku in Product Data table 3)
             "ma_value": int(round(value)),
             pd_primary: f"{metric_key}_{safe_label}_{dist_code}_{year}-{month:02d}",
             "_product_guid": product_guid,
