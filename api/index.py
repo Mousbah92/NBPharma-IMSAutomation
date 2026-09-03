@@ -940,7 +940,7 @@ def parse_mtd_sales(file_bytes, fallback_month=None, fallback_year=None):
             pm["tender_val"] += val
         else:
             # ZUCR (normal), ZRE5 (return - keeps negative qty), and all other → PRIVATE
-            pm["private_qty"] += qty
+            pm["private_qty"] += 1
             pm["private_val"] += val
 
         pm["total_qty"] += qty
