@@ -1277,7 +1277,8 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
 
 # ── PIPELINE C: UPLOAD RAW TRANSACTIONS (ma_IMSRawTransactions) ──
 
-def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_guids, dist_set, prod_set):
+def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_guids,
+                                     dist_set, prod_set, all_products):
     """Upload individual transaction rows from MTD Sales to ma_IMSRawTransactions."""
     results = {"raw_created": 0, "raw_failed": 0, "errors": []}
 
@@ -1329,8 +1330,14 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
             month, year = 9, 2025
 
         payload = {"ma_distributor@odata.bind": f"/{dist_set}({dist_guid})"}
-        if brand in brand_guids:
-            payload["ma_product@odata.bind"] = f"/{prod_set}({brand_guids[brand]})"
+
+        # Resolve the exact SKU, including strength/pack size.  Brand-level matching
+        # is unsafe here: NEUPRO 2MG, 4MG, 6MG and 8MG would otherwise all be linked
+        # to whichever NEUPRO product was encountered first.
+        item_code = get_col_str(row, col, "material_code")
+        product_guid, _ = resolve_product(item_code, product_name, all_products)
+        if product_guid:
+            payload["ma_product@odata.bind"] = f"/{prod_set}({product_guid})"
 
         field_map = {
             "ma_distributoritemcode": get_col_str(row, col, "material_code"),
@@ -1392,6 +1399,40 @@ def pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_gui
 
     wb.close()
     log.info(f"Raw transactions: {len(all_payloads)} payloads prepared from {row_count} rows")
+
+    # Do not insert the same source transaction again when the file is reprocessed.
+    # The primary-name value generated above is deterministic for a given file row.
+    # Load existing IDs for this distributor, then discard payloads already present.
+    if raw_primary and all_payloads:
+        existing_ids = set()
+        select_name = raw_primary
+        existing_url = (
+            f"{API_URL}/{raw_set}?$select={select_name}"
+            f"&$filter=_ma_distributor_value eq {dist_guid}"
+        )
+        while existing_url:
+            existing_resp = http_requests.get(existing_url, headers=get_headers(), timeout=30)
+            if existing_resp.status_code != 200:
+                results["errors"].append(
+                    f"RAW DEDUP LOOKUP: {existing_resp.status_code}; raw upload stopped to prevent duplicates"
+                )
+                return results
+            existing_data = existing_resp.json()
+            existing_ids.update(
+                str(record.get(select_name, ""))
+                for record in existing_data.get("value", [])
+                if record.get(select_name)
+            )
+            existing_url = existing_data.get("@odata.nextLink")
+
+        before_dedup = len(all_payloads)
+        all_payloads = [
+            payload for payload in all_payloads
+            if str(payload.get(raw_primary, "")) not in existing_ids
+        ]
+        skipped = before_dedup - len(all_payloads)
+        if skipped:
+            log.info(f"Raw transaction dedup: skipped {skipped} existing rows")
 
     # Submit via $batch API — 50 records per batch request
     BATCH_SIZE = 50
@@ -1697,7 +1738,10 @@ def process_file(file_type, file_bytes, distributor_hint=None, period_hint=(None
             f"Metrics: {mr['metrics_created']} new, {mr.get('metrics_updated', 0)} updated")
 
         # PIPELINE C: Upload raw transactions (MTD only)
-        rr = pipeline_upload_raw_transactions(file_type, file_bytes, dist_guid, brand_guids, dist_set, prod_set)
+        rr = pipeline_upload_raw_transactions(
+            file_type, file_bytes, dist_guid, brand_guids,
+            dist_set, prod_set, all_products
+        )
         results["raw_created"] = rr["raw_created"]
         results["failed"] += rr["raw_failed"]
         results["errors"].extend(rr["errors"])
