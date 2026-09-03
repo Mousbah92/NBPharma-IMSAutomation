@@ -1182,6 +1182,18 @@ def pipeline_upload_metrics(file_type, stock_product_agg, mtd_product_metrics,
             "_metric_int": METRICS[metric_key],
         })
 
+        log.info(
+            "METRIC DEBUG: sku_key=%s, material=%s, description=%s, "
+            "private_qty=%s, total_qty=%s, month=%s, year=%s",
+            sku_key,
+            v.get("material"),
+            v.get("description"),
+            v.get("private_qty"),
+            v.get("total_qty"),
+            month,
+            year,
+        )
+
     if file_type == "closing_stock" and stock_product_agg:
         for material, vals in stock_product_agg.items():
             desc = vals.get("description", "")
